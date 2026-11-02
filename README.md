@@ -26,10 +26,12 @@ the viewer on `127.0.0.1`, so it works behind a corporate VPN or proxy.
 ## Install
 
 ```bash
-pip install git+https://github.com/adityapalve/valet
+uv tool install git+https://github.com/adityapalve/valet
 ```
 
-or, from a clone, `pip install -e .`
+This puts `valet` on your PATH in its own isolated environment, so the agent's terminal finds it
+whatever venv is active. (`pipx install …` or `pip install …` work too. For a private repo use
+`git+ssh://git@github.com/adityapalve/valet`.) Upgrade with `uv tool upgrade valet`.
 
 ## Use with Amazon Q (or any agent with a terminal tool)
 
@@ -54,8 +56,25 @@ paste the same text (`valet/cli.py: RULES`) into their rules or `AGENTS.md`.
 | `valet log` / `valet show [id] [--full]` | browse runs from the terminal |
 | `valet ui [--port N]` | live viewer |
 
-Python is resolved from `$VALET_PYTHON`, then `python` / `python3` on `PATH`, so an active
-venv is respected. `$VALET_HOME` overrides where the `.valet/` store lives.
+### Which Python runs the script (and where packages come from)
+
+valet itself has no dependencies. The scripts it runs get their packages from:
+
+1. **`$VALET_PYTHON`**, if set: always used.
+2. **PEP 723 inline dependencies** (when uv is installed): a script with a header like
+   ```python
+   # /// script
+   # dependencies = ["pandas", "pyarrow"]
+   # ///
+   ```
+   runs as `uv run --script`, in an isolated environment that uv builds once and caches. The
+   rules tell the agent to do this instead of `pip install`, so the dependencies are part of the
+   script, and valet's snapshot of the script records them too.
+3. **A uv project** (a `uv.lock` above the current directory): scripts run with `uv run python`,
+   so they use the project's synced `.venv`.
+4. Otherwise, **`python` / `python3` on `PATH`**, so an active venv is respected.
+
+Set `VALET_UV=0` to turn off the uv behaviour. `$VALET_HOME` overrides where the `.valet/` store lives.
 
 ## Design notes
 

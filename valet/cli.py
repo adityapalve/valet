@@ -39,6 +39,16 @@ send you instructions through it. Follow these rules for this project:
 - Put throwaway scripts in `.valet/scratch/`. Edit and re-run the same file as
   you iterate instead of creating `script_v2.py`, `script_v3.py`; valet keeps
   every version.
+- If a scratch script needs a package that isn't installed, do NOT `pip install`
+  it. Declare it at the top of the script and valet will run it with uv in a
+  cached environment:
+  ```
+  # /// script
+  # dependencies = ["pandas", "pyarrow"]
+  # ///
+  ```
+  (A script with this header runs isolated from the project's environment, so
+  only use it for standalone scratch scripts.)
 - Print compact output: `df.head()`, `df.shape`, `df.describe()`, never whole
   dataframes or files.
 - If the output ends with a `[valet] Message from the user` block, treat it as a
@@ -53,6 +63,39 @@ def python_exe() -> str:
         or shutil.which("python3")
         or sys.executable
     )
+
+
+def has_inline_deps(script: Path) -> bool:
+    """True if the script declares PEP 723 inline metadata (`# /// script`)."""
+    try:
+        with script.open(encoding="utf-8") as fh:
+            return any(line.rstrip() == "# /// script" for line in fh)
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def in_uv_project(start: Path) -> bool:
+    cur = start.resolve()
+    return any((d / "uv.lock").is_file() for d in (cur, *cur.parents))
+
+
+def python_cmd(script: Path) -> list[str]:
+    """How to launch a python script.
+
+    $VALET_PYTHON wins if set. Otherwise, when uv is installed:
+      - a script with PEP 723 inline deps runs as `uv run --script` (isolated, cached env)
+      - inside a uv project (uv.lock found) it runs as `uv run python` (the project's .venv)
+    and in every other case the `python` on PATH is used.
+    """
+    if os.environ.get("VALET_PYTHON"):
+        return [os.environ["VALET_PYTHON"]]
+    uv = shutil.which("uv")
+    if uv and os.environ.get("VALET_UV", "1") != "0":
+        if has_inline_deps(script):
+            return [uv, "run", "--script"]
+        if in_uv_project(Path.cwd()):
+            return [uv, "run", "python"]
+    return [python_exe()]
 
 
 def execute(store: Store, argv: list[str], snapshot: list[Path] | None = None) -> int:
@@ -135,8 +178,8 @@ def cmd_py(store: Store, args: list[str]) -> int:
             script = store.home / "scratch" / f"snippet-{stamp}-{n}.py"
         script.write_text(code, encoding="utf-8")
         print(f"[valet] saved snippet to {script}", flush=True)
-        return execute(store, [python_exe(), str(script), *rest], snapshot=[script])
-    return execute(store, [python_exe(), *args])
+        return execute(store, [*python_cmd(script), str(script), *rest], snapshot=[script])
+    return execute(store, [*python_cmd(Path(args[0])), *args])
 
 
 def cmd_run(store: Store, args: list[str]) -> int:

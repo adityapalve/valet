@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -82,3 +83,54 @@ def test_ui_api(tmp_path):
     finally:
         proc.terminate()
         proc.wait()
+
+
+def _env_with_fake_uv(tmp_path):
+    """PATH with a fake `uv` that just prints the arguments it was called with."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake = bindir / "uv"
+    fake.write_text("#!/bin/sh\necho \"FAKE-UV $*\"\n")
+    fake.chmod(0o755)
+    env = dict(os.environ, VALET_HOME=str(tmp_path / ".valet"), PYTHONPATH=str(ROOT),
+               PATH=f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    env.pop("VALET_PYTHON", None)
+    return env
+
+
+def _run(tmp_path, env, *args):
+    return subprocess.run([sys.executable, "-m", "valet", *args], cwd=tmp_path, env=env,
+                          capture_output=True, text=True, timeout=30).stdout
+
+
+def test_uv_runner_selection(tmp_path):
+    env = _env_with_fake_uv(tmp_path)
+    plain = tmp_path / "plain.py"
+    plain.write_text("print('plain')\n")
+    inline = tmp_path / "inline.py"
+    inline.write_text('# /// script\n# dependencies = ["pandas"]\n# ///\nprint(1)\n')
+
+    # inline deps -> uv run --script
+    assert "FAKE-UV run --script inline.py" in _run(tmp_path, env, "py", "inline.py")
+    # plain script outside a uv project -> regular python, uv not involved
+    out = _run(tmp_path, env, "py", "plain.py")
+    assert "plain" in out and "FAKE-UV" not in out
+    # inside a uv project -> uv run python
+    (tmp_path / "uv.lock").write_text("")
+    assert "FAKE-UV run python plain.py" in _run(tmp_path, env, "py", "plain.py")
+    # VALET_UV=0 opts out, VALET_PYTHON overrides everything
+    assert "FAKE-UV" not in _run(tmp_path, dict(env, VALET_UV="0"), "py", "plain.py")
+    assert "FAKE-UV" not in _run(tmp_path, dict(env, VALET_PYTHON=sys.executable), "py", "inline.py")
+
+
+@pytest.mark.skipif(not shutil.which("uv"), reason="uv not installed")
+def test_real_uv_inline_script(tmp_path):
+    env = dict(os.environ, VALET_HOME=str(tmp_path / ".valet"), PYTHONPATH=str(ROOT))
+    env.pop("VALET_PYTHON", None)
+    code = '# /// script\n# dependencies = []\n# ///\nimport sys\nprint("in", sys.prefix)\n'
+    r = subprocess.run([sys.executable, "-m", "valet", "py", "-"], input=code, cwd=tmp_path,
+                       env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    show = subprocess.run([sys.executable, "-m", "valet", "show", "1"], cwd=tmp_path, env=env,
+                          capture_output=True, text=True).stdout
+    assert "uv run --script" in show and "in " in show
