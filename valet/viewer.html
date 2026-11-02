@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>valet</title>
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6b66; --line: #e3e3de;
+  --accent: #2f5bd3; --ok: #1f8a4c; --bad: #c2372b; --run: #b7791f;
+  --add-bg: #e6f4ea; --add: #1a6e3a; --del-bg: #fbe9e7; --del: #a02a1f; --hunk: #6a55b8;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161615; --panel: #1f1f1d; --ink: #e8e8e3; --muted: #9a9a93; --line: #33332f;
+    --accent: #7c9cff; --ok: #4cc27f; --bad: #ff7b6e; --run: #e6b450;
+    --add-bg: #1d3325; --add: #8fe0a9; --del-bg: #3a2220; --del: #ffaaa1; --hunk: #b9a6ff;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; height: 100vh;
+  display: grid; grid-template-rows: auto 1fr; }
+header { display: flex; gap: 12px; align-items: center; padding: 10px 16px;
+  border-bottom: 1px solid var(--line); background: var(--panel); flex-wrap: wrap; }
+header h1 { font-size: 15px; margin: 0; letter-spacing: .02em; }
+#note-form { flex: 1; display: flex; gap: 8px; min-width: 260px; }
+#note { flex: 1; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--bg); color: var(--ink); font: inherit; }
+button { padding: 7px 12px; border-radius: 6px; border: 1px solid var(--accent);
+  background: var(--accent); color: #fff; font: inherit; cursor: pointer; }
+button.ghost { background: transparent; color: var(--accent); }
+#pending { display: flex; gap: 6px; flex-wrap: wrap; width: 100%; }
+#pending:empty { display: none; }
+.chip { font-size: 12px; padding: 3px 8px; border-radius: 999px; background: var(--bg);
+  border: 1px dashed var(--run); color: var(--ink); }
+.chip b { cursor: pointer; margin-left: 6px; color: var(--muted); }
+main { display: grid; grid-template-columns: minmax(220px, 320px) 1fr; min-height: 0; }
+#runs { overflow: auto; border-right: 1px solid var(--line); background: var(--panel); }
+.run { padding: 8px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.run:hover { background: var(--bg); }
+.run.sel { background: var(--bg); box-shadow: inset 3px 0 0 var(--accent); }
+.run .top { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); }
+.run .cmd { font-family: var(--mono); font-size: 12px; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+.dot.ok { background: var(--ok); } .dot.bad { background: var(--bad); }
+.dot.run { background: var(--run); animation: pulse 1s infinite; }
+@keyframes pulse { 50% { opacity: .3; } }
+#detail { overflow: auto; padding: 16px 20px; min-width: 0; }
+.empty { color: var(--muted); padding: 40px; text-align: center; }
+.meta { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+.cmdline { font-family: var(--mono); background: var(--panel); border: 1px solid var(--line);
+  padding: 8px 10px; border-radius: 6px; overflow-x: auto; white-space: pre; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted);
+  margin: 20px 0 6px; display: flex; gap: 8px; align-items: center; }
+h2 .path { text-transform: none; letter-spacing: 0; font-family: var(--mono); color: var(--ink); }
+.tabs { display: flex; gap: 4px; flex-shrink: 0; margin-left: auto; }
+.tabs button { padding: 2px 8px; font-size: 11px; }
+h2 .path { overflow-wrap: anywhere; }
+pre.code { margin: 0; font-family: var(--mono); font-size: 12.5px; background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px; padding: 10px; overflow: auto; max-height: 60vh; }
+pre.code span { display: block; }
+.add { background: var(--add-bg); color: var(--add); }
+.del { background: var(--del-bg); color: var(--del); }
+.hunk { color: var(--hunk); }
+.note-delivered { border-left: 3px solid var(--run); padding: 6px 10px; background: var(--panel);
+  margin-top: 6px; border-radius: 0 6px 6px 0; }
+label.follow { font-size: 12px; color: var(--muted); display: flex; gap: 4px; align-items: center; }
+@media (max-width: 700px) {
+  main { grid-template-columns: 1fr; grid-template-rows: 35vh 1fr; }
+  #runs { border-right: 0; border-bottom: 1px solid var(--line); }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>valet</h1>
+  <form id="note-form">
+    <input id="note" placeholder="Message the agent; it sees this at the end of its next run" autocomplete="off">
+    <button>Send</button>
+  </form>
+  <label class="follow"><input type="checkbox" id="follow" checked> follow latest</label>
+  <div id="pending"></div>
+</header>
+<main>
+  <nav id="runs"></nav>
+  <section id="detail"><div class="empty">No runs yet. Have the agent run something with <code>valet py</code>.</div></section>
+</main>
+<script>
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let selected = null, lastDetailKey = "", fileView = {};
+
+function status(r) { return r.exit_code === null ? "run" : (r.exit_code === 0 ? "ok" : "bad"); }
+function ago(ts) { return new Date(ts * 1000).toLocaleTimeString(); }
+function shortCmd(argv) {
+  return argv.map((a, i) => i === 0 ? a.split(/[\\/]/).pop() : (a.includes("/.valet/scratch/") ? "scratch/" + a.split("/").pop() : a)).join(" ");
+}
+
+function renderDiff(diff) {
+  return diff.split("\n").map((l) => {
+    const cls = l.startsWith("@@") ? "hunk" : (l.startsWith("+") && !l.startsWith("+++")) ? "add"
+      : (l.startsWith("-") && !l.startsWith("---")) ? "del" : "";
+    return `<span class="${cls}">${esc(l) || " "}</span>`;
+  }).join("");
+}
+
+function renderFile(f, runId, cwd) {
+  const shown = f.path.startsWith(cwd + "/") ? f.path.slice(cwd.length + 1) : f.path;
+  const key = runId + f.path;
+  const hasDiff = f.diff !== null;
+  const view = fileView[key] || (f.diff ? "diff" : "full");
+  let body;
+  if (view === "diff" && f.diff) body = `<pre class="code">${renderDiff(f.diff)}</pre>`;
+  else if (view === "diff" && f.diff === "") body = `<div class="meta">unchanged since run #${f.prev_run}</div>`;
+  else body = `<pre class="code">${esc(f.content)}</pre>`;
+  const tabs = hasDiff ? `<span class="tabs">
+      <button class="${view === "diff" ? "" : "ghost"}" data-key="${esc(key)}" data-view="diff">diff vs #${f.prev_run}</button>
+      <button class="${view === "full" ? "" : "ghost"}" data-key="${esc(key)}" data-view="full">full</button></span>` : `<span class="meta">first version</span>`;
+  return `<h2>script <span class="path" title="${esc(f.path)}">${esc(shown)}</span>${tabs}</h2>${body}`;
+}
+
+async function loadDetail(force) {
+  if (selected === null) return;
+  const r = await (await fetch(`/api/runs/${selected}`)).json();
+  if (r.error) return;
+  const key = JSON.stringify([r.id, r.exit_code, r.output.length, fileView]);
+  if (!force && key === lastDetailKey) return;
+  lastDetailKey = key;
+  const outEl = document.getElementById("out");
+  const atBottom = outEl && outEl.scrollTop + outEl.clientHeight >= outEl.scrollHeight - 20;
+  const st = status(r);
+  $("#detail").innerHTML = `
+    <div class="meta"><span class="dot ${st}"></span>run #${r.id} · ${ago(r.started)} ·
+      ${r.exit_code === null ? "running…" : "exit " + r.exit_code} ${r.duration != null ? "· " + r.duration.toFixed(1) + "s" : ""} · ${esc(r.cwd)}</div>
+    <div class="cmdline">$ ${esc(r.argv.join(" "))}</div>
+    ${r.files.map((f) => renderFile(f, r.id, r.cwd)).join("")}
+    <h2>output ${r.truncated ? '<span class="meta">(truncated)</span>' : ""}</h2>
+    <pre class="code" id="out">${esc(r.output) || '<span class="meta">(no output)</span>'}</pre>
+    ${r.notes.map((n) => `<div class="note-delivered"><b>delivered to agent:</b> ${esc(n.text)}</div>`).join("")}`;
+  const o = document.getElementById("out");
+  if (atBottom || r.exit_code === null) o.scrollTop = o.scrollHeight;
+}
+
+async function tick() {
+  try {
+    const { runs, pending } = await (await fetch("/api/runs")).json();
+    if (runs.length && (selected === null || $("#follow").checked)) selected = runs[0].id;
+    $("#runs").innerHTML = runs.map((r) => `
+      <div class="run ${r.id === selected ? "sel" : ""}" data-id="${r.id}">
+        <div class="top"><span><span class="dot ${status(r)}"></span>#${r.id}</span><span>${ago(r.started)}</span></div>
+        <div class="cmd" title="${esc(r.argv.join(" "))}">${esc(shortCmd(r.argv))}</div>
+      </div>`).join("");
+    $("#pending").innerHTML = pending.map((n) =>
+      `<span class="chip">queued: ${esc(n.text)}<b data-del="${n.id}" title="withdraw">×</b></span>`).join("");
+    await loadDetail(false);
+  } catch (e) { /* server restarting; try again next tick */ }
+}
+
+$("#runs").addEventListener("click", (e) => {
+  const el = e.target.closest(".run"); if (!el) return;
+  selected = +el.dataset.id; $("#follow").checked = false; tick();
+});
+$("#detail").addEventListener("click", (e) => {
+  const b = e.target.closest("button[data-view]"); if (!b) return;
+  fileView[b.dataset.key] = b.dataset.view; loadDetail(true);
+});
+$("#pending").addEventListener("click", async (e) => {
+  const id = e.target.dataset.del; if (!id) return;
+  await fetch("/api/notes/delete", { method: "POST", body: JSON.stringify({ id: +id }) }); tick();
+});
+$("#note-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const text = $("#note").value.trim(); if (!text) return;
+  await fetch("/api/notes", { method: "POST", body: JSON.stringify({ text }) });
+  $("#note").value = ""; tick();
+});
+tick(); setInterval(tick, 1500);
+</script>
+</body>
+</html>
