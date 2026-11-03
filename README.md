@@ -26,7 +26,8 @@ the terminal exactly as before, so the agent's own terminal tool sees it, and on
 - **Outputs as tables**: every DataFrame a run writes (`write_csv`, `to_parquet`, ...) or prints
   (`print(df.head(20))`), from pandas or polars, shows up as a sortable, filterable table with
   column types, % missing and a summary of every column computed over the whole frame
-  (histogram and range, or top values), compared against the same file from the previous run. CSV/TSV files
+  (histogram and range, or top values). Each output is compared row by row with its previous
+  version: rows added, removed and changed, and which cells changed from what to what. CSV/TSV files
   and images (plots) written any other way are picked up too.
 - **Charts in one line**: `import valet_view as vv; vv.chart(df, x=..., y=..., kind="bar")` draws
   an interactive chart in the viewer, from pandas, polars or plain lists, with nothing to install.
@@ -191,13 +192,31 @@ that python process (or log out), then update.
   min/max, mean and median; text gets its top values and distinct count; dates get their range.
   Frames over 1M rows are profiled on a seeded 1M-row sample (marked "sampled"). The "column
   summaries" checkbox hides them. (CSV files found on disk get a preview but no profile.)
-- **Compared to last time.** An output is compared with the same path in the previous run that
-  produced it: rows added or removed, columns added or removed.
+- **Compared row by row to last time.** See below.
 - **Told to the agent.** The run summary lists the outputs, e.g.
   `[valet] outputs: output/xcl_usage.csv (13,043 x 22)`.
 - Sorting and filtering apply to the preview rows (the first 200). Previews are stored in
   `.valet/`; set `VALET_TRAIL_PROFILE=0` to keep data out of it, or `VALET_MAX_ARTIFACTS` to change
   the per-run limit (default 20).
+
+### Row changes between runs
+
+![row changes](docs/rowdiff.png)
+
+When a run writes an output it wrote before, valet says which rows were **added**, **removed** and
+**changed** (with each changed cell's old → new value), and which columns changed most:
+
+- Rows are matched by a **key**: the shortest run of leading columns (up to 4) that is present and
+  unique in both versions (last run's key is kept while it still works). Set it explicitly with
+  `vv.key("output/usage.csv", ["base", "cpsc"])`. Without a usable key, identical rows are matched
+  as a multiset (a changed row then counts as one removed + one added).
+- It works for frames written through pandas/polars (compared in-process, from the full frame)
+  and for CSV/TSV files written any other way. The two are fingerprinted separately, since they
+  format values differently.
+- The agent sees it too: `[valet] outputs: output/xcl_usage.csv (8,065 x 23; +0 -21 ~1 rows vs run #13)`.
+  The rules ask it to investigate changes it didn't intend.
+- To compare, valet keeps the previous version's rows in `.valet/fingerprints/` (one file per
+  output path). Tables over 3M cells aren't diffed (`VALET_DIFF_MAX_CELLS`).
 
 ### Charts
 

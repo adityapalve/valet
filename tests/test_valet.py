@@ -643,3 +643,72 @@ def test_outputs_carry_full_frame_column_profiles(tmp_path):
     x, cat = art["profile"]
     assert x["min"] == 0 and x["max"] == 999 and x["mean"] == 499.5 and sum(x["hist"]["counts"]) == 1000
     assert cat["top"] == [["a", 700], ["b", 200]] and cat["distinct"] == 3 and art["profile_sampled"] is False
+
+
+# ---- row-level output diffs -------------------------------------------------------------------
+
+WRITE_USAGE = (
+    "import polars as pl\n"
+    "rows = {rows!r}\n"
+    "pl.DataFrame(rows, schema=['base', 'cpsc', 'vl1', 'vl2'], orient='row').write_csv('usage.csv')\n")
+
+
+@pytest.mark.skipif(importlib.util.find_spec("polars") is None, reason="polars not installed")
+def test_row_diff_between_runs_with_auto_key(tmp_path):
+    v1 = [("b1", "010", 1, 0), ("b1", "020", 0, 1), ("b2", "010", 1, 1)]
+    v2 = [("b1", "010", 0, 0), ("b2", "010", 1, 1), ("b3", "030", 1, 0)]   # changed, removed, kept, added
+    (tmp_path / "s.py").write_text(WRITE_USAGE.format(rows=v1))
+    first = valet(tmp_path, "py", "s.py").stdout
+    assert "usage.csv (3 x 4)" in first                     # nothing to compare with yet
+    (tmp_path / "s.py").write_text(WRITE_USAGE.format(rows=v2))
+    r = valet(tmp_path, "py", "s.py")
+    assert "usage.csv (3 x 4; +1 -1 ~1 rows vs run #1)" in r.stdout
+    d = _run_json(tmp_path, 2)["artifacts"][0]["diff"]
+    assert d["key"] == ["base", "cpsc"] and d["vs_run"] == 1     # base alone isn't unique
+    assert (d["added"], d["removed"], d["changed"], d["unchanged"]) == (1, 1, 1, 1)
+    assert d["samples"]["changed"] == [{"key": ["b1", "010"], "cells": [["vl1", "1", "0"]]}]
+    assert d["samples"]["added"][0]["key"] == ["b3", "030"] and d["samples"]["removed"][0]["key"] == ["b1", "020"]
+    assert d["col_changes"] == {"vl1": 1}
+
+
+@pytest.mark.skipif(importlib.util.find_spec("polars") is None, reason="polars not installed")
+def test_row_diff_key_override_and_keyless_tables(tmp_path):
+    (tmp_path / "s.py").write_text("import valet_view as vv\nvv.key('usage.csv', ['cpsc', 'base'])\n" +
+                                   WRITE_USAGE.format(rows=[("b1", "010", 1, 0)]))
+    valet(tmp_path, "py", "s.py")
+    (tmp_path / "s.py").write_text(WRITE_USAGE.format(rows=[("b1", "010", 1, 1)]))
+    valet(tmp_path, "py", "s.py")
+    d = _run_json(tmp_path, 2)["artifacts"][0]["diff"]
+    assert d["key"] == ["cpsc", "base"] and d["changed"] == 1     # the explicit key is remembered
+
+    # no unique leading columns: rows are compared as a multiset
+    (tmp_path / "k.py").write_text("import polars as pl\npl.DataFrame({'a': [1, 1, 2]}).write_csv('dups.csv')\n")
+    valet(tmp_path, "py", "k.py")
+    (tmp_path / "k.py").write_text("import polars as pl\npl.DataFrame({'a': [1, 2, 2]}).write_csv('dups.csv')\n")
+    valet(tmp_path, "py", "k.py")
+    d = _run_json(tmp_path, 4)["artifacts"][0]["diff"]
+    assert d["key"] is None and (d["added"], d["removed"], d["changed"]) == (1, 1, None)
+
+
+def test_row_diff_for_csvs_written_without_dataframes(tmp_path):
+    script = "import csv\nw = csv.writer(open('out.csv', 'w', newline=''))\nw.writerows({rows!r})\n"
+    (tmp_path / "s.py").write_text(script.format(rows=[["id", "v"], [1, "a"], [2, "b"]]))
+    valet(tmp_path, "py", "s.py")
+    (tmp_path / "s.py").write_text(script.format(rows=[["id", "v"], [1, "a"], [2, "B"], [3, "c"]]))
+    r = valet(tmp_path, "py", "s.py")
+    assert "out.csv (3 x 2; +1 -0 ~1 rows vs run #1)" in r.stdout
+    d = _run_json(tmp_path, 2)["artifacts"][0]["diff"]
+    assert d["key"] == ["id"] and d["samples"]["changed"] == [{"key": ["2"], "cells": [["v", "b", "B"]]}]
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pandas") is None, reason="pandas not installed")
+def test_row_diff_never_compares_frame_and_csv_fingerprints_or_huge_tables(tmp_path):
+    (tmp_path / "a.py").write_text("import pandas as pd\npd.DataFrame({'id': [1], 'x': [1.0]}).to_csv('o.csv', index=False)\n")
+    (tmp_path / "b.py").write_text("open('o.csv', 'w').write('id,x\\n1,1.0\\n')\n")
+    valet(tmp_path, "py", "a.py")
+    valet(tmp_path, "py", "b.py")       # same file, different writer: no (misleading) comparison
+    assert _run_json(tmp_path, 2)["artifacts"][0]["diff"] is None
+    env = dict(os.environ, VALET_HOME=str(tmp_path / ".valet"), VALET_PYTHON=sys.executable,
+               PYTHONPATH=str(ROOT), VALET_DIFF_MAX_CELLS="1")
+    subprocess.run([sys.executable, "-m", "valet", "py", "a.py"], cwd=tmp_path, env=env, capture_output=True)
+    assert _run_json(tmp_path, 3)["artifacts"][0]["diff"] == {"skipped": "too big to diff"}

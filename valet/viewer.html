@@ -188,6 +188,15 @@ pre.code span { display: block; }
 .grid th .prof .topv span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 110px; }
 .grid th .prof .bar { height: 3px; background: var(--accent); border-radius: 2px; grid-column: 1 / 3; margin-bottom: 2px; opacity: .7; }
 .art.noprof .prof { display: none; }
+.rowdiff { border-bottom: 1px solid var(--line); padding: 6px 12px; font-size: 12.5px; }
+.rowdiff summary { cursor: pointer; color: var(--muted); }
+.rowdiff .chips { margin: 6px 0; display: flex; flex-wrap: wrap; gap: 4px; }
+.rowdiff .chip2 { font-family: var(--mono); font-size: 11px; padding: 1px 6px; border-radius: 3px; background: var(--bg); border: 1px solid var(--line); }
+.rowdiff table { border-collapse: collapse; font-family: var(--mono); font-size: 12px; margin-top: 4px; }
+.rowdiff td { padding: 2px 10px 2px 0; vertical-align: top; white-space: nowrap; }
+.rowdiff .k-added { color: var(--add); } .rowdiff .k-removed { color: var(--del); } .rowdiff .k-changed { color: var(--hunk); }
+.rowdiff .old { color: var(--del); text-decoration: line-through; } .rowdiff .new { color: var(--add); }
+.rowdiff .scroll { max-height: 300px; overflow: auto; }
 .art-tools label { font-size: 12px; color: var(--muted); display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
 .note-delivered { border-left: 3px solid var(--run); padding: 6px 10px; background: var(--panel);
   margin-top: 6px; border-radius: 0 6px 6px 0; }
@@ -489,7 +498,17 @@ function renderOutputs(r) {
 }
 
 function compareHtml(a) {
-  const p = a.prev;
+  const p = a.prev, d = a.diff;
+  if (d && d.vs_run != null && d.added != null) {   // row-level: much more than shape
+    const bits = [];
+    if (d.added) bits.push(`<span class="up">+${d.added.toLocaleString()} added</span>`);
+    if (d.removed) bits.push(`<span class="down">−${d.removed.toLocaleString()} removed</span>`);
+    if (d.changed) bits.push(`<span>${d.changed.toLocaleString()} changed</span>`);
+    (d.cols_added || []).forEach((c) => bits.push(`<span class="up">+${esc(c)}</span>`));
+    (d.cols_removed || []).forEach((c) => bits.push(`<span class="down">−${esc(c)}</span>`));
+    if (!bits.length) bits.push("no row changes");
+    return `<span class="art-cmp">vs run #${d.vs_run}${d.key ? ` (rows matched by ${esc(d.key.join(" + "))})` : ""}: ${bits.join(" · ")}</span>`;
+  }
   if (!p) return "";
   const bits = [];
   if (p.shape && a.shape) {
@@ -529,6 +548,29 @@ function profileHtml(p, n) {
   return p.distinct != null ? `<div class="prof">${p.distinct.toLocaleString()} distinct</div>` : "";
 }
 
+function rowDiffHtml(d) {
+  if (!d || d.vs_run == null || d.added == null || !(d.added || d.removed || d.changed)) {
+    return d && d.skipped ? `<div class="rowdiff">row changes not tracked: ${esc(d.skipped)}</div>` : "";
+  }
+  const s = d.samples || {}, cols = d.columns || [], ocols = d.old_columns || cols;
+  const keyN = (d.key || []).length;
+  const vals = (row, names) => row.slice(keyN, keyN + 8).map((v, i) => `${esc(names[keyN + i])}=${esc(v)}`).join("  ");
+  const keyTxt = (x) => esc((x.key || x.row.slice(0, 2)).join(" / "));
+  const rows = [
+    ...(s.changed || []).map((x) => `<tr><td class="k-changed">changed</td><td>${keyTxt(x)}</td><td>${
+      x.cells.map(([c, o, n]) => `${esc(c)}: <span class="old">${esc(o) || "∅"}</span> → <span class="new">${esc(n) || "∅"}</span>`).join(" · ")}</td></tr>`),
+    ...(s.added || []).map((x) => `<tr><td class="k-added">added</td><td>${keyTxt(x)}</td><td>${vals(x.row, cols)}</td></tr>`),
+    ...(s.removed || []).map((x) => `<tr><td class="k-removed">removed</td><td>${keyTxt(x)}</td><td>${vals(x.row, ocols)}</td></tr>`),
+  ];
+  const shownN = rows.length, total = (d.added || 0) + (d.removed || 0) + (d.changed || 0);
+  const chips = Object.entries(d.col_changes || {}).map(([c, n]) => `<span class="chip2">${esc(c)} ×${n.toLocaleString()}</span>`).join("");
+  return `<details class="rowdiff" ${total <= 200 ? "open" : ""}><summary>row changes vs run #${d.vs_run}${
+      shownN < total ? ` (showing ${shownN} of ${total.toLocaleString()})` : ""}</summary>
+    ${chips ? `<div class="chips"><span class="meta" style="margin:0">changed columns:</span>${chips}</div>` : ""}
+    ${d.note ? `<div class="meta">${esc(d.note)}</div>` : ""}
+    <div class="scroll"><table>${rows.join("")}</table></div></details>`;
+}
+
 function buildArtifact(a, r) {
   const el = document.createElement("div");
   el.className = "art";
@@ -561,6 +603,8 @@ function buildArtifact(a, r) {
     return el;
   }
   if (!a.columns) return el;   // e.g. a parquet file written some other way: listed, no preview
+  const rd = rowDiffHtml(a.diff);
+  if (rd) el.insertAdjacentHTML("beforeend", rd);
 
   const rows = a.rows || [];
   const state = { sort: null, dir: 1, q: "" };
@@ -584,7 +628,7 @@ function buildArtifact(a, r) {
         nulls == null ? "" : `<div class="nulltxt">${nulls ? pct.toFixed(1) + "% missing" : "no missing"}</div><div class="nullbar"><i style="width:${Math.min(100, pct)}%"></i></div>`}${
         a.profile ? profileHtml(a.profile[i], n - (nulls || 0)) : ""}</th>`;
     }).join("")}</tr></thead><tbody></tbody></table></div>`);
-  const tbody = el.querySelector("tbody"), count = el.querySelector(".count");
+  const tbody = el.querySelector(".grid tbody"), count = el.querySelector(".count");
   const draw = () => {
     let list = rows.map((r, i) => [i, r]);
     if (state.q) { const q = state.q.toLowerCase(); list = list.filter(([, r]) => r.some((v) => String(v).toLowerCase().includes(q))); }
@@ -599,7 +643,7 @@ function buildArtifact(a, r) {
       (state.sort !== null ? ` · sorted by ${a.columns[state.sort]} ${state.dir > 0 ? "↑" : "↓"} (preview rows only)` : "") +
       (a.more_columns ? ` · +${a.more_columns} more columns` : "");
   };
-  el.querySelector("thead").addEventListener("click", (e) => {
+  el.querySelector(".grid thead").addEventListener("click", (e) => {
     const th = e.target.closest("th[data-col]"); if (!th) return;
     const c = +th.dataset.col;
     state.dir = state.sort === c ? -state.dir : 1; state.sort = c; draw();

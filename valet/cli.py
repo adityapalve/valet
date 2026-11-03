@@ -23,6 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from .hook.valet_rowdiff import summary as rowdiff_summary
 from .outputs import derive_title, human_size, parse_error, scan_outputs, tidy_snippet
 from .store import Store, find_home, read_trail_file, trail_file
 
@@ -69,9 +70,13 @@ send you instructions through it. Follow these rules for this project:
   vv.chart(df, x="minutes", kind="hist")          # also: bar, point, area, box, heatmap
   vv.vega({...vega-lite spec...}, data=df)        # anything custom
   vv.table(df, "Top 20 users")                    # a titled table
+  vv.key("output/usage.csv", ["base", "cpsc"])    # how to match rows between runs
   ```
   `df` can be pandas, polars or a list of dicts. Aggregate first: charts use at
   most 5,000 rows. Each call prints `[valet] chart: <title>` when it worked.
+- When you write an output file, the run summary says how its rows changed since
+  the last run, e.g. `(+12 -3 ~41 rows vs run #7)`. If that's not what you
+  intended, say so and investigate before moving on.
 - Print compact output: `df.head()`, `df.shape`, `df.describe()`, never whole
   dataframes or files. The user sees printed and written dataframes as tables
   in the viewer (up to 200 rows), so `print(df.head(20))` is plenty.
@@ -200,7 +205,7 @@ def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None,
                 rec.call("snapshot", run_id, Path(a))
 
     trail = trail_file(rec.home, run_id if run_id is not None else f"unrecorded-{os.getpid()}")
-    env = dict(os.environ, PYTHONUNBUFFERED="1", VALET_RUN_ID=str(run_id or ""))
+    env = dict(os.environ, PYTHONUNBUFFERED="1", VALET_RUN_ID=str(run_id or ""), VALET_DIR=str(rec.home))
     if os.environ.get("VALET_TRAIL_OFF") != "1":
         # the hook dir holds a sitecustomize.py that records dataframe operations
         hook = str(Path(__file__).parent / "hook")
@@ -264,7 +269,7 @@ def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None,
         # files the run created or changed that the hook didn't already capture
         if os.environ.get("VALET_SCAN_OUTPUTS", "1") != "0":
             known = {a["path"] for a in captured if a.get("path")} | {str(p.resolve()) for p in snapshot or []}
-            outputs = scan_outputs(cwd, started, known)
+            outputs = scan_outputs(cwd, started, known, valet_dir=str(rec.home), run_id=run_id)
             if outputs:
                 rec.call("set_artifacts", run_id, outputs, ("file", "image", "html"))
         notes = rec.call("take_notes", run_id, default=[])
@@ -282,7 +287,8 @@ def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None,
         def describe(a: dict) -> str:
             name = os.path.relpath(a["path"], cwd) if a["path"].startswith(cwd) else a["path"]
             if a.get("shape"):
-                return f"{name} ({a['shape'][0]:,} x {a['shape'][1]})"
+                change = rowdiff_summary(a.get("diff"))
+                return f"{name} ({a['shape'][0]:,} x {a['shape'][1]}{'; ' + change if change else ''})"
             return f"{name} ({human_size(a['size'])})" if a.get("size") else name
         shown = ", ".join(describe(a) for a in written[:4])
         trailer += f"\n[valet] outputs: {shown}" + (f" and {len(written) - 4} more" if len(written) > 4 else "")

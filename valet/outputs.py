@@ -17,6 +17,8 @@ import time
 from itertools import islice
 from pathlib import Path
 
+from .hook import valet_rowdiff as rd
+
 SKIP_DIRS = {".git", ".hg", ".svn", ".valet", "node_modules", ".venv", "venv", "env", "__pycache__",
              "site-packages", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox", ".idea", ".vscode",
              ".ipynb_checkpoints"}
@@ -30,8 +32,10 @@ EXACT_COUNT_LIMIT = 50_000_000      # bytes; bigger CSVs get an estimated row co
 MAX_OUTPUTS = 20
 
 
-def scan_outputs(root: str | Path, since: float, skip: set[str], budget_s: float = 1.5) -> list[dict]:
-    """Data files and images under `root` modified at or after `since` (excluding `skip` paths)."""
+def scan_outputs(root: str | Path, since: float, skip: set[str], budget_s: float = 1.5,
+                 valet_dir: str | None = None, run_id: int | None = None) -> list[dict]:
+    """Data files and images under `root` modified at or after `since` (excluding `skip` paths).
+    With `valet_dir`, CSV/TSV files also get a row diff against their previous version."""
     found: list[dict] = []
     deadline = time.monotonic() + budget_s
     for dirpath, dirnames, filenames in os.walk(root):
@@ -53,7 +57,7 @@ def scan_outputs(root: str | Path, since: float, skip: set[str], budget_s: float
             art = {"type": kind, "path": path, "size": st.st_size}
             if ext in TABULAR:
                 try:
-                    art.update(preview_csv(Path(path)))
+                    art.update(preview_csv(Path(path), valet_dir, run_id))
                     art["type"] = "file"
                     art["lib"] = "csv"
                 except Exception as e:  # noqa: BLE001 - a weird file must not break the run
@@ -64,8 +68,9 @@ def scan_outputs(root: str | Path, since: float, skip: set[str], budget_s: float
     return found
 
 
-def preview_csv(path: Path) -> dict:
-    """Header, first rows, row count, simple dtypes and empty-cell counts of a CSV/TSV."""
+def preview_csv(path: Path, valet_dir: str | None = None, run_id: int | None = None) -> dict:
+    """Header, first rows, row count, simple dtypes and empty-cell counts of a CSV/TSV, and (with
+    `valet_dir`) a row diff against the previous version of the file."""
     size = path.stat().st_size
     with path.open("rb") as fh:
         head = fh.read(65536)
@@ -82,21 +87,34 @@ def preview_csv(path: Path) -> dict:
         header = next(reader, [])
         ncols = len(header)
         cols = header[:PREVIEW_COLS]
-        rows = [[_cell(v) for v in r[:PREVIEW_COLS]] for r in islice(reader, PREVIEW_ROWS)]
+        first = list(islice(reader, PREVIEW_ROWS))
+        rows = [[_cell(v) for v in r[:PREVIEW_COLS]] for r in first]
         n = len(rows)
+        # rows for the row diff; collection stops (full = None) once past rd.MAX_CELLS
+        full = [[rd.cell(v) for v in r] for r in first] if valet_dir is not None and size <= EXACT_COUNT_LIMIT else None
         empties = [sum(1 for r in rows if i >= len(r) or r[i] == "") for i in range(len(cols))]
         estimated = False
         if n == PREVIEW_ROWS:
             if size <= EXACT_COUNT_LIMIT:
                 for r in reader:
                     n += 1
+                    if full is not None:
+                        full.append([rd.cell(v) for v in r])
+                        if len(full) * max(1, ncols) > rd.MAX_CELLS:
+                            full = None
                     for i in range(min(len(cols), len(r))):
                         if r[i] == "":
                             empties[i] += 1
             else:  # too big to count quickly: estimate from the average line length
                 estimated = True
                 n = int(size / (len(head) / max(1, head.count(b"\n")))) - 1
+    diff = None
+    if full is not None and not estimated:
+        diff = rd.diff_and_save(valet_dir, str(path), header, full, run_id, "csv")
+    elif valet_dir is not None:
+        diff = {"skipped": "too big to diff"}
     return {
+        "diff": diff,
         "shape": [n, ncols], "columns": cols, "dtypes": [_infer(rows, i) for i in range(len(cols))],
         "nulls": None if estimated else empties, "rows": rows, "rows_estimated": estimated,
         "more_columns": max(0, ncols - PREVIEW_COLS),

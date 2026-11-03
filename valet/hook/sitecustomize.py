@@ -392,10 +392,42 @@ def _artifact(kind, obj, lib, target=None, title=None):
         if title:
             rec["title"] = str(title)
         rec.update(_snapshot(obj, lib, profile=True))
+        if kind == "write" and path:
+            d = _row_diff(obj, lib, path)
+            if d:
+                rec["diff"] = d
         _artifact_count[0] += 1
         _emit(rec)
     except Exception:
         pass
+
+
+def _row_diff(obj, lib, path):
+    """Rows added/removed/changed vs the previous version of this output (see valet_rowdiff)."""
+    valet_dir = os.environ.get("VALET_DIR")
+    if not valet_dir:
+        return None
+    prev = getattr(_state, "busy", False)
+    _state.busy = True
+    try:
+        import valet_rowdiff as rd
+        if lib == "polars":
+            if obj.height * max(1, obj.width) > rd.MAX_CELLS:
+                return {"skipped": "too big to diff"}
+            columns, rows = obj.columns, [[rd.cell(v) for v in r] for r in obj.rows()]
+        else:
+            df = obj.to_frame() if getattr(obj, "ndim", 2) == 1 else obj
+            if df.shape[0] * max(1, df.shape[1]) > rd.MAX_CELLS:
+                return {"skipped": "too big to diff"}
+            if type(df.index).__name__ != "RangeIndex" or df.index.name is not None:
+                df = df.reset_index()
+            columns, rows = list(df.columns), [[rd.cell(v) for v in r] for r in df.itertuples(index=False, name=None)]
+        run_id = os.environ.get("VALET_RUN_ID") or ""
+        return rd.diff_and_save(valet_dir, path, columns, rows, int(run_id) if run_id.isdigit() else None, "frame")
+    except Exception:
+        return None
+    finally:
+        _state.busy = prev
 
 
 def _wrap_print(cls, name, lib):

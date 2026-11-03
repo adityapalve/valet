@@ -18,7 +18,7 @@ import math
 import os
 import sys
 
-__all__ = ["chart", "vega", "table"]
+__all__ = ["chart", "vega", "table", "key"]
 
 KINDS = ("bar", "line", "point", "area", "hist", "box", "heatmap", "tick")
 
@@ -119,6 +119,19 @@ def table(data, title=None):
     lib = "polars" if type(data).__module__.split(".")[0] == "polars" else "pandas"
     hook._artifact("print", data, lib, None, title)
     print(f"[valet] table: {title or 'dataframe'}", flush=True)
+    return None
+
+
+def key(path, columns):
+    """The columns that identify a row of the output file `path`, used to match rows between
+    runs ("which rows changed?"). valet guesses a key otherwise; set it when the guess is wrong."""
+    valet_dir = os.environ.get("VALET_DIR")
+    if not valet_dir:
+        print("[valet] valet_view: not running under `valet py`; nothing set", flush=True)
+        return None
+    import valet_rowdiff
+    valet_rowdiff.set_key(valet_dir, path, [str(c) for c in columns])
+    print(f"[valet] key for {path}: {', '.join(map(str, columns))}", flush=True)
     return None
 
 
