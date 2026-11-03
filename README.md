@@ -15,8 +15,11 @@ the terminal exactly as before, so the agent's own terminal tool sees it, and on
 - **You can steer**: type a message in the viewer (or `valet note "..."`), and it is appended
   to the output of the agent's *next* run as `[valet] Message from the user`. The agent's
   rules tell it to treat that as a direct instruction.
+- **A data trail for pandas**: every DataFrame transformation is recorded with its shape before
+  and after, the keys it used, the line of code, and the `#` comment above it explaining why.
+  Joins that multiply rows are flagged, to you *and* to the agent.
 - **A live viewer**: `valet ui` serves a local page showing the run timeline, script
-  diffs, streaming output and queued notes.
+  diffs, the data trail, streaming output and queued notes.
 
 ![viewer](docs/viewer.png)
 
@@ -55,6 +58,30 @@ paste the same text (`valet/cli.py: RULES`) into their rules or `AGENTS.md`.
 | `valet note "text"` | queue a message for the agent's next run |
 | `valet log` / `valet show [id] [--full]` | browse runs from the terminal |
 | `valet ui [--port N]` | live viewer |
+
+### Data trail
+
+When a script run through valet imports pandas, valet records each transformation, with no
+change to the code:
+
+![data trail](docs/trail.png)
+
+- **Recorded:** `read_*` / `to_*`, `merge` / `join` / `concat`, `drop_duplicates`, `dropna`,
+  `drop`, `query`, boolean-mask filters (`df[mask]`, `df.loc[mask]`), `assign`, `rename`,
+  `fillna`, `pivot` / `pivot_table` / `melt` / `explode`, and groupby aggregations. Each step
+  stores its parameters (dedupe `subset`, join `on` / `how`, groupby keys…), input and output
+  shapes, columns added and removed, and the calling line.
+- **The why:** the rules ask the agent to put a one-line `#` comment above each
+  transformation. valet shows that comment as the step's description, so the trail reads like
+  "one row per event_id: 5,300 → 5,000 rows".
+- **Warnings:** a left or inner join that *adds* rows (duplicate keys on the right), an inner join
+  that drops rows, concat inputs with mismatched columns, or a step that empties the frame. These
+  are also printed at the end of the run as `[valet] Data warnings`, so the agent sees them too.
+- **How:** valet puts a stdlib-only `sitecustomize.py` on the child's `PYTHONPATH`. It patches
+  pandas only once the script imports it, records only top-level calls (not pandas' internal
+  ones), chains to any existing `sitecustomize`, and never raises into your code. It also works
+  under `uv run --script`. Overhead is a shape lookup per call. Turn it off with
+  `VALET_TRAIL_OFF=1`.
 
 ### Which Python runs the script (and where packages come from)
 
@@ -98,6 +125,11 @@ command's output is the most reliable channel available.
   kernel so the agent reaches the viewer through code.
 - **Approve gate**: optionally hold a run until you click Run in the viewer, or edit the
   script before it runs (must stay inside the agent's command timeout).
+- **Replay ("durable" state)**: valet already stores every script version in run order, so a
+  crashed or reset session (or kernel) can be rebuilt with `valet replay --until 12`. Optionally,
+  checkpoint DataFrames to parquet at chosen steps so replay can resume from there.
+- **Data trail, more**: polars support; null-rate and key-uniqueness checks on join keys;
+  linking steps into a DAG (which frame came from which).
 - **Optional MCP front-end** over the same store, for agents/IDEs where MCP is available.
 - **Workspace diffs**: also record files the scripts *wrote*, not just the ones they ran.
   Zed's DeltaDB (operation-level history, private beta as of late 2026) is worth watching here.

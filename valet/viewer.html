@@ -65,6 +65,29 @@ pre.code span { display: block; }
 .add { background: var(--add-bg); color: var(--add); }
 .del { background: var(--del-bg); color: var(--del); }
 .hunk { color: var(--hunk); }
+.trail { display: grid; gap: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.trail-sum { font-size: 12px; color: var(--muted); padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.trail-sum b { color: var(--ink); font-family: var(--mono); font-weight: 600; }
+.step { display: grid; grid-template-columns: 140px 1fr auto; gap: 4px 12px; padding: 9px 12px;
+  border-bottom: 1px solid var(--line); align-items: baseline; }
+.step:last-child { border-bottom: 0; }
+.op { font-family: var(--mono); font-size: 11.5px; padding: 1px 7px; border-radius: 4px; justify-self: start;
+  background: var(--bg); border: 1px solid var(--line); white-space: nowrap; }
+.op.k-reduce { color: var(--bad); } .op.k-combine { color: var(--accent); }
+.op.k-agg { color: var(--hunk); } .op.k-io { color: var(--muted); }
+.step .why { grid-column: 2; }
+.step .code-line { grid-column: 2; font-family: var(--mono); font-size: 12px; color: var(--muted);
+  overflow-wrap: anywhere; }
+.step .loc { grid-column: 3; grid-row: 1; font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+.step .shapes { grid-column: 2; font-family: var(--mono); font-size: 12.5px; }
+.delta { margin-left: 8px; font-size: 12px; }
+.delta.down { color: var(--bad); } .delta.up { color: var(--accent); }
+.colchip { font-family: var(--mono); font-size: 11px; padding: 0 5px; border-radius: 3px; margin: 0 3px 0 0; }
+.colchip.add { background: var(--add-bg); color: var(--add); } .colchip.rm { background: var(--del-bg); color: var(--del); }
+.step .warn { grid-column: 2 / 4; background: var(--del-bg); color: var(--del); border-radius: 4px;
+  padding: 4px 8px; font-size: 12.5px; }
+.badge-warn { font-size: 11px; color: var(--bad); margin-left: 6px; }
+@media (max-width: 700px) { .step { grid-template-columns: 1fr; } .step > * { grid-column: 1 !important; grid-row: auto !important; } }
 .note-delivered { border-left: 3px solid var(--run); padding: 6px 10px; background: var(--panel);
   margin-top: 6px; border-radius: 0 6px 6px 0; }
 label.follow { font-size: 12px; color: var(--muted); display: flex; gap: 4px; align-items: center; }
@@ -107,6 +130,55 @@ function renderDiff(diff) {
   }).join("");
 }
 
+
+const fmtShape = (sh) => sh ? sh.map((n) => n.toLocaleString()).join(" × ") : "?";
+function opKind(op) {
+  if (op.startsWith("read:") || op.startsWith("write:")) return "k-io";
+  if (/filter|drop_duplicates|dropna|query|^drop$/.test(op)) return "k-reduce";
+  if (/merge|join|concat/.test(op)) return "k-combine";
+  if (op.startsWith("groupby") || /pivot|melt/.test(op)) return "k-agg";
+  return "";
+}
+function renderStep(st) {
+  const ins = st.inputs || [];
+  const rin = ins[0] && ins[0].shape ? ins[0].shape[0] : null;
+  const rout = st.output ? st.output[0] : null;
+  let delta = "";
+  if (rin !== null && rout !== null && rin !== rout) {
+    const d = rout - rin, pct = rin ? Math.abs(100 * d / rin).toFixed(1) : "∞";
+    delta = `<span class="delta ${d < 0 ? "down" : "up"}">${d > 0 ? "+" : "−"}${Math.abs(d).toLocaleString()} rows (${pct}%)</span>`;
+  }
+  const shapes = ins.length ? ins.map((i) => fmtShape(i.shape)).join(" + ") + " → " + fmtShape(st.output) : fmtShape(st.output);
+  const params = Object.entries(st.params || {}).map(([k, v]) => `${k}=${v}`).join(", ");
+  const cols = [
+    ...(st.cols_added || []).map((c) => `<span class="colchip add">+${esc(c)}</span>`),
+    ...(st.cols_removed || []).map((c) => `<span class="colchip rm">−${esc(c)}</span>`),
+  ].join("");
+  const site = st.site || {};
+  return `<div class="step">
+    <span class="op ${opKind(st.op)}" title="${esc(params)}">${esc(st.op)}</span>
+    ${site.comment ? `<div class="why">${esc(site.comment)}</div>` : ""}
+    <span class="loc">${site.file ? esc(site.file.split(/[\\/]/).pop() + ":" + site.line) : ""}</span>
+    <div class="code-line">${esc(site.code || params)}</div>
+    <div class="shapes">${shapes}${delta}${cols ? " &nbsp;" + cols : ""}</div>
+    ${(st.warnings || []).map((w) => `<div class="warn">⚠ ${esc(w)}</div>`).join("")}
+  </div>`;
+}
+function renderTrail(trail) {
+  if (!trail || !trail.length) return "";
+  const loads = trail.filter((s) => s.op.startsWith("read:"));
+  const writes = trail.filter((s) => s.op.startsWith("write:"));
+  const nw = trail.reduce((n, s) => n + (s.warnings || []).length, 0);
+  const io = (s) => `<b>${fmtShape(s.output)}</b> ${esc(Object.values(s.params || {})[0] || "")}`;
+  const sum = [
+    loads.length ? "in: " + loads.map(io).join(", ") : "",
+    writes.length ? "out: " + writes.map(io).join(", ") : "",
+    nw ? `<span class="badge-warn">⚠ ${nw} warning${nw > 1 ? "s" : ""}</span>` : "",
+  ].filter(Boolean).join(" &nbsp;·&nbsp; ");
+  return `<h2>data trail <span class="meta">${trail.length} steps</span></h2>
+    <div class="trail">${sum ? `<div class="trail-sum">${sum}</div>` : ""}${trail.map(renderStep).join("")}</div>`;
+}
+
 function renderFile(f, runId, cwd) {
   const shown = f.path.startsWith(cwd + "/") ? f.path.slice(cwd.length + 1) : f.path;
   const key = runId + f.path;
@@ -126,7 +198,7 @@ async function loadDetail(force) {
   if (selected === null) return;
   const r = await (await fetch(`/api/runs/${selected}`)).json();
   if (r.error) return;
-  const key = JSON.stringify([r.id, r.exit_code, r.output.length, fileView]);
+  const key = JSON.stringify([r.id, r.exit_code, r.output.length, (r.trail || []).length, fileView]);
   if (!force && key === lastDetailKey) return;
   lastDetailKey = key;
   const outEl = document.getElementById("out");
@@ -137,6 +209,7 @@ async function loadDetail(force) {
       ${r.exit_code === null ? "running…" : "exit " + r.exit_code} ${r.duration != null ? "· " + r.duration.toFixed(1) + "s" : ""} · ${esc(r.cwd)}</div>
     <div class="cmdline">$ ${esc(r.argv.join(" "))}</div>
     ${r.files.map((f) => renderFile(f, r.id, r.cwd)).join("")}
+    ${renderTrail(r.trail)}
     <h2>output ${r.truncated ? '<span class="meta">(truncated)</span>' : ""}</h2>
     <pre class="code" id="out">${esc(r.output) || '<span class="meta">(no output)</span>'}</pre>
     ${r.notes.map((n) => `<div class="note-delivered"><b>delivered to agent:</b> ${esc(n.text)}</div>`).join("")}`;
@@ -150,7 +223,7 @@ async function tick() {
     if (runs.length && (selected === null || $("#follow").checked)) selected = runs[0].id;
     $("#runs").innerHTML = runs.map((r) => `
       <div class="run ${r.id === selected ? "sel" : ""}" data-id="${r.id}">
-        <div class="top"><span><span class="dot ${status(r)}"></span>#${r.id}</span><span>${ago(r.started)}</span></div>
+        <div class="top"><span><span class="dot ${status(r)}"></span>#${r.id}${r.trail_warnings ? `<span class="badge-warn">⚠ ${r.trail_warnings}</span>` : ""}</span><span>${ago(r.started)}</span></div>
         <div class="cmd" title="${esc(r.argv.join(" "))}">${esc(shortCmd(r.argv))}</div>
       </div>`).join("");
     $("#pending").innerHTML = pending.map((n) =>

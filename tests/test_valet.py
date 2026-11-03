@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import shutil
@@ -134,3 +135,73 @@ def test_real_uv_inline_script(tmp_path):
     show = subprocess.run([sys.executable, "-m", "valet", "show", "1"], cwd=tmp_path, env=env,
                           capture_output=True, text=True).stdout
     assert "uv run --script" in show and "in " in show
+
+
+PIPELINE = '''import pandas as pd
+events = pd.DataFrame({"event_id": [1, 1, 2, 3, 4], "user_id": [10, 10, 11, 12, 12]})
+users = pd.DataFrame({"user_id": [10, 11, 12, 12], "region": ["N", "S", "E", "W"]})
+# one row per event
+events = events.drop_duplicates(subset=["event_id"])
+events = events[events["event_id"] > 1]
+# attach region
+out = events.merge(users, on="user_id", how="left")
+out.dropna(inplace=True)
+print(out.groupby("region").size().to_dict())
+'''
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pandas") is None, reason="pandas not installed")
+def test_data_trail_records_pandas_steps(tmp_path):
+    (tmp_path / "p.py").write_text(PIPELINE)
+    r = valet(tmp_path, "py", "p.py")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "dataframe steps recorded" in r.stdout
+    assert "join fan-out" in r.stdout and "(p.py:8)" in r.stdout  # warning reaches the agent
+
+    run = _run_json(tmp_path, 1)
+    ops = [s["op"] for s in run["trail"]]
+    assert ops == ["drop_duplicates", "filter", "merge", "dropna", "groupby.size"]
+    dedupe, filt, merge, dropna, _ = run["trail"]
+    assert dedupe["params"]["subset"] == "['event_id']"
+    assert dedupe["inputs"][0]["shape"] == [5, 2] and dedupe["output"] == [4, 2]
+    assert dedupe["site"]["comment"] == "one row per event"
+    assert filt["output"] == [3, 2] and filt["site"]["comment"] is None
+    assert merge["output"] == [5, 3] and merge["cols_added"] == ["region"] and merge["warnings"]
+    assert dropna["output"] == [5, 3]  # inplace is recorded via the mutated frame
+    assert run["trail_warnings"] == 1
+
+
+def test_trail_is_inert_without_pandas_and_chains_sitecustomize(tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "sitecustomize.py").write_text("import builtins; builtins.CHAINED = True\n")
+    env = dict(os.environ, VALET_HOME=str(tmp_path / ".valet"), VALET_PYTHON=sys.executable,
+               PYTHONPATH=os.pathsep.join([str(ROOT), str(other)]))
+    r = subprocess.run([sys.executable, "-m", "valet", "py", "-c",
+                        "import builtins, sys; print('chained', getattr(builtins, 'CHAINED', False), "
+                        "'pandas' in sys.modules)"],
+                       cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    assert "chained True False" in r.stdout  # existing sitecustomize ran; pandas not imported
+    assert "dataframe steps" not in r.stdout
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pandas") is None, reason="pandas not installed")
+def test_trail_can_be_turned_off(tmp_path):
+    (tmp_path / "p.py").write_text(PIPELINE)
+    env = dict(os.environ, VALET_HOME=str(tmp_path / ".valet"), VALET_PYTHON=sys.executable,
+               PYTHONPATH=str(ROOT), VALET_TRAIL_OFF="1")
+    r = subprocess.run([sys.executable, "-m", "valet", "py", "p.py"], cwd=tmp_path, env=env,
+                       capture_output=True, text=True, timeout=30)
+    assert r.returncode == 0 and "dataframe steps" not in r.stdout
+
+
+def _run_json(tmp_path, run_id):
+    sys.path.insert(0, str(ROOT))
+    try:
+        from valet.store import Store
+        store = Store(tmp_path / ".valet")
+        run = store.get_run(run_id)
+        run["trail_warnings"] = store.list_runs(1)[0]["trail_warnings"]
+        return run
+    finally:
+        sys.path.remove(str(ROOT))

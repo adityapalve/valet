@@ -63,6 +63,11 @@ class Store:
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript(SCHEMA)
+        cols = {r[1] for r in self.db.execute("PRAGMA table_info(runs)")}
+        if "trail" not in cols:  # added in 0.2: data trail of dataframe operations
+            self.db.execute("ALTER TABLE runs ADD COLUMN trail TEXT")
+            self.db.execute("ALTER TABLE runs ADD COLUMN trail_warnings INTEGER NOT NULL DEFAULT 0")
+            self.db.commit()
 
     # ---- runs -------------------------------------------------------------
     def start_run(self, argv: list[str], cwd: str) -> int:
@@ -96,6 +101,30 @@ class Store:
         )
         self.db.commit()
 
+    def trail_path(self, run_id: int) -> Path:
+        d = self.home / "trails"
+        d.mkdir(exist_ok=True)
+        return d / f"{run_id}.jsonl"
+
+    def ingest_trail(self, run_id: int) -> list[dict]:
+        """Copy the run's trail file (written by the hook) into the database."""
+        path = self.trail_path(run_id)
+        if not path.exists():
+            return []
+        steps = []
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                steps.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass  # a line still being written
+        n_warn = sum(len(st.get("warnings") or []) for st in steps)
+        self.db.execute(
+            "UPDATE runs SET trail = ?, trail_warnings = ? WHERE id = ?",
+            (json.dumps(steps), n_warn, run_id),
+        )
+        self.db.commit()
+        return steps
+
     def finish_run(self, run_id: int, exit_code: int, output: str) -> None:
         started = self.db.execute("SELECT started FROM runs WHERE id = ?", (run_id,)).fetchone()[0]
         self.update_output(run_id, output)
@@ -107,7 +136,8 @@ class Store:
 
     def list_runs(self, limit: int = 50) -> list[dict]:
         rows = self.db.execute(
-            "SELECT id, started, duration, cwd, argv, exit_code FROM runs ORDER BY id DESC LIMIT ?",
+            "SELECT id, started, duration, cwd, argv, exit_code, trail_warnings FROM runs "
+            "ORDER BY id DESC LIMIT ?",
             (limit,),
         ).fetchall()
         return [dict(r, argv=json.loads(r["argv"])) for r in rows]
@@ -117,6 +147,7 @@ class Store:
         if r is None:
             return None
         run = dict(r, argv=json.loads(r["argv"]))
+        run["trail"] = json.loads(r["trail"]) if r["trail"] else []
         run["files"] = []
         for f in self.db.execute(
             "SELECT f.path, f.hash, b.content FROM files f JOIN blobs b ON b.hash = f.hash "

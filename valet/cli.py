@@ -49,6 +49,12 @@ send you instructions through it. Follow these rules for this project:
   ```
   (A script with this header runs isolated from the project's environment, so
   only use it for standalone scratch scripts.)
+- Before each dataframe transformation (merge, filter, dedupe, groupby…), write a
+  one-line `#` comment saying *why*, e.g. `# keep the latest event per user`.
+  valet records every pandas step with its shapes and shows your comment next
+  to it, so the user can follow how the data changed.
+- If the output contains `[valet] Data warnings` (e.g. a join that multiplied
+  rows), investigate and fix or explain it before moving on.
 - Print compact output: `df.head()`, `df.shape`, `df.describe()`, never whole
   dataframes or files.
 - If the output ends with a `[valet] Message from the user` block, treat it as a
@@ -111,6 +117,11 @@ def execute(store: Store, argv: list[str], snapshot: list[Path] | None = None) -
             store.snapshot(run_id, Path(a))
 
     env = dict(os.environ, PYTHONUNBUFFERED="1", VALET_RUN_ID=str(run_id))
+    if os.environ.get("VALET_TRAIL_OFF") != "1":
+        # the hook dir holds a sitecustomize.py that records dataframe operations
+        hook = str(Path(__file__).parent / "hook")
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, [hook, os.environ.get("PYTHONPATH")]))
+        env["VALET_TRAIL"] = str(store.trail_path(run_id))
     chunks: list[str] = []
     out = sys.stdout.buffer
     try:
@@ -135,6 +146,7 @@ def execute(store: Store, argv: list[str], snapshot: list[Path] | None = None) -
             chunks.append(data.decode("utf-8", errors="replace"))
             if time.monotonic() - last_flush > 1.0:  # live output for the viewer
                 store.update_output(run_id, "".join(chunks))
+                store.ingest_trail(run_id)
                 last_flush = time.monotonic()
         code = proc.wait()
     except KeyboardInterrupt:
@@ -149,8 +161,18 @@ def execute(store: Store, argv: list[str], snapshot: list[Path] | None = None) -
 
     output = "".join(chunks)
     store.finish_run(run_id, code, output)
+    steps = store.ingest_trail(run_id)
+    store.trail_path(run_id).unlink(missing_ok=True)
 
     trailer = f"\n[valet] run #{run_id} · exit {code}"
+    if steps:
+        trailer += f" · {len(steps)} dataframe steps recorded"
+    warnings = [
+        f"  - {w}  ({Path(st['site']['file']).name}:{st['site']['line']})" if st.get("site") else f"  - {w}"
+        for st in steps for w in st.get("warnings") or []
+    ]
+    if warnings:
+        trailer += "\n[valet] Data warnings (check these before continuing):\n" + "\n".join(warnings[:10])
     notes = store.take_notes(run_id)
     if notes:
         trailer += "\n[valet] Message from the user (they are watching this run):\n"
@@ -229,11 +251,37 @@ def cmd_show(store: Store, run_id: int | None, full: bool) -> int:
         else:
             print(f"--- {f['path']}")
             print(f["content"])
+    if r["trail"]:
+        print("--- data trail")
+        for st in r["trail"]:
+            print("  " + format_step(st))
+        print()
     print("--- output" + (" (truncated)" if r["truncated"] else ""))
     print(r["output"])
     for n in r["notes"]:
         print(f"--- note delivered: {n['text']}")
     return 0
+
+
+def fmt_shape(shape) -> str:
+    if not shape:
+        return "?"
+    return " × ".join(f"{n:,}" for n in shape)
+
+
+def format_step(st: dict) -> str:
+    params = ", ".join(f"{k}={v}" for k, v in (st.get("params") or {}).items())
+    ins = " + ".join(fmt_shape(i.get("shape")) for i in st.get("inputs") or [])
+    line = f"{st['op']}({params})  {ins + ' → ' if ins else ''}{fmt_shape(st.get('output'))}"
+    if st.get("cols_added"):
+        line += f"  +cols {st['cols_added']}"
+    if st.get("cols_removed"):
+        line += f"  -cols {st['cols_removed']}"
+    if st.get("site"):
+        line += f"  @{Path(st['site']['file']).name}:{st['site']['line']}"
+    for w in st.get("warnings") or []:
+        line += f"\n    ! {w}"
+    return line
 
 
 def cmd_init() -> int:
