@@ -400,9 +400,9 @@ def test_script_versions_and_bundled_diff_renderer(tmp_path):
 def test_polars_writes_and_prints_become_artifacts(tmp_path):
     (tmp_path / "out").mkdir()
     (tmp_path / "s.py").write_text(
-        "# XCL usage check\n"
+        "# Penguin size check\n"
         "import polars as pl\n"
-        "df = pl.DataFrame({'base': ['A', 'B', None], 'vl': [1, 2, 3]})\n"
+        "df = pl.DataFrame({'species': ['A', 'B', None], 'mass': [1, 2, 3]})\n"
         "print(df)\n"
         "df.write_csv('out/usage.csv')\n")
     r = valet(tmp_path, "py", "s.py")
@@ -410,17 +410,17 @@ def test_polars_writes_and_prints_become_artifacts(tmp_path):
     assert "[valet] outputs: out/usage.csv (3 x 2)" in r.stdout.replace("\\", "/")
     assert r.stdout.isascii() or "\u2502" in r.stdout  # valet's own lines are ASCII (polars draws boxes)
     run = _run_json(tmp_path, 1)
-    assert run["title"] == "XCL usage check"
+    assert run["title"] == "Penguin size check"
     types = [a["type"] for a in run["artifacts"]]
     assert types == ["print", "write"]  # the CSV was captured by the hook, so the scan skips it
     printed, written = run["artifacts"]
     assert printed["lib"] == "polars" and printed["shape"] == [3, 2] and printed["site"]["line"] == 4
-    assert written["columns"] == ["base", "vl"] and written["nulls"] == [1, 0]
+    assert written["columns"] == ["species", "mass"] and written["nulls"] == [1, 0]
     assert written["rows"][0] == ["A", "1"] and written["path"].endswith("usage.csv")
 
     # same file in the next run: compared against the previous run's version
     (tmp_path / "s.py").write_text("import polars as pl\n"
-                                   "pl.DataFrame({'base': ['A'], 'vl': [1], 'x': [0]}).write_csv('out/usage.csv')\n")
+                                   "pl.DataFrame({'species': ['A'], 'mass': [1], 'x': [0]}).write_csv('out/usage.csv')\n")
     valet(tmp_path, "py", "s.py")
     art = _run_json(tmp_path, 2)["artifacts"][0]
     assert art["prev"]["run_id"] == 1 and art["prev"]["shape"] == [3, 2] and art["shape"] == [1, 3]
@@ -539,16 +539,16 @@ def test_closed_stdout_pipe_still_records_the_run(tmp_path):
 def test_polars_transformation_steps(tmp_path):
     (tmp_path / "s.py").write_text(
         "import polars as pl\n"
-        "df = pl.DataFrame({'base': ['W5a', 'b1', 'b2', 'b2'], 'vl': ['x', 'x', 'y', 'y']})\n"
-        "# drop fixing parts\n"
-        "fixing = df.filter(pl.col('base').str.starts_with('W5'))\n"
-        "df = df.join(fixing, on=['base', 'vl'], how='anti')\n"
+        "df = pl.DataFrame({'bird': ['T1', 'b1', 'b2', 'b2'], 'island': ['x', 'x', 'y', 'y']})\n"
+        "# drop test birds\n"
+        "test_birds = df.filter(pl.col('bird').str.starts_with('T'))\n"
+        "df = df.join(test_birds, on=['bird', 'island'], how='anti')\n"
         "# one row per base\n"
         "out = (df.unique()\n"
         "         .with_columns(pl.lit(1).alias('used')))\n"
-        "owners = pl.DataFrame({'vl': ['x', 'x'], 'who': ['a', 'b']})\n"
-        "per_vl = out.group_by('vl').agg(pl.len().alias('n')).join(owners, on='vl', how='left')\n"
-        "lazy = out.lazy().filter(pl.col('vl') == 'y').collect()\n")
+        "sites = pl.DataFrame({'island': ['x', 'x'], 'site': ['a', 'b']})\n"
+        "per_island = out.group_by('island').agg(pl.len().alias('n')).join(sites, on='island', how='left')\n"
+        "lazy = out.lazy().filter(pl.col('island') == 'y').collect()\n")
     r = valet(tmp_path, "py", "s.py")
     assert r.returncode == 0, r.stdout + r.stderr
     assert "join fan-out" in r.stdout and "(s.py:10)" in r.stdout
@@ -557,13 +557,13 @@ def test_polars_transformation_steps(tmp_path):
     assert ops == ["filter", "join", "unique", "with_columns", "group_by.agg", "join", "collect"], ops
     flt, anti, uniq, withc, gb, left, coll = steps
     assert 'starts_with' in flt["params"]["predicates"] and flt["output"] == [1, 2]
-    assert anti["params"] == {"on": "[base, vl]", "how": "anti"} and anti["output"] == [3, 2]
+    assert anti["params"] == {"on": "[bird, island]", "how": "anti"} and anti["output"] == [3, 2]
     assert anti["in_nodes"][1] == flt["out_node"]                 # lineage: the filtered frame fed the join
     assert uniq["output"] == [2, 2] and withc["cols_added"] == ["used"]
     assert uniq["site"]["comment"] == withc["site"]["comment"] == "one row per base"   # chained statement
-    assert gb["params"] == {"by": "[vl]", "aggs": "[n]"} and left["warnings"]
+    assert gb["params"] == {"by": "[island]", "aggs": "[n]"} and left["warnings"]
     assert "FILTER" in coll["params"]["plan"] and coll["output"] == [1, 3]
-    assert steps[0]["node"]["profile"]["columns"] == ["base", "vl"]
+    assert steps[0]["node"]["profile"]["columns"] == ["bird", "island"]
 
 
 # ---- readable errors --------------------------------------------------------------------------
@@ -650,13 +650,13 @@ def test_outputs_carry_full_frame_column_profiles(tmp_path):
 WRITE_USAGE = (
     "import polars as pl\n"
     "rows = {rows!r}\n"
-    "pl.DataFrame(rows, schema=['base', 'cpsc', 'vl1', 'vl2'], orient='row').write_csv('usage.csv')\n")
+    "pl.DataFrame(rows, schema=['island', 'nest', 'y2008', 'y2009'], orient='row').write_csv('usage.csv')\n")
 
 
 @pytest.mark.skipif(importlib.util.find_spec("polars") is None, reason="polars not installed")
 def test_row_diff_between_runs_with_auto_key(tmp_path):
-    v1 = [("b1", "010", 1, 0), ("b1", "020", 0, 1), ("b2", "010", 1, 1)]
-    v2 = [("b1", "010", 0, 0), ("b2", "010", 1, 1), ("b3", "030", 1, 0)]   # changed, removed, kept, added
+    v1 = [("b1", "n1", 1, 0), ("b1", "n2", 0, 1), ("b2", "n1", 1, 1)]
+    v2 = [("b1", "n1", 0, 0), ("b2", "n1", 1, 1), ("b3", "n3", 1, 0)]   # changed, removed, kept, added
     (tmp_path / "s.py").write_text(WRITE_USAGE.format(rows=v1))
     first = valet(tmp_path, "py", "s.py").stdout
     assert "usage.csv (3 x 4)" in first                     # nothing to compare with yet
@@ -664,22 +664,22 @@ def test_row_diff_between_runs_with_auto_key(tmp_path):
     r = valet(tmp_path, "py", "s.py")
     assert "usage.csv (3 x 4; +1 -1 ~1 rows vs run #1)" in r.stdout
     d = _run_json(tmp_path, 2)["artifacts"][0]["diff"]
-    assert d["key"] == ["base", "cpsc"] and d["vs_run"] == 1     # base alone isn't unique
+    assert d["key"] == ["island", "nest"] and d["vs_run"] == 1   # island alone isn't unique
     assert (d["added"], d["removed"], d["changed"], d["unchanged"]) == (1, 1, 1, 1)
-    assert d["samples"]["changed"] == [{"key": ["b1", "010"], "cells": [["vl1", "1", "0"]]}]
-    assert d["samples"]["added"][0]["key"] == ["b3", "030"] and d["samples"]["removed"][0]["key"] == ["b1", "020"]
-    assert d["col_changes"] == {"vl1": 1}
+    assert d["samples"]["changed"] == [{"key": ["b1", "n1"], "cells": [["y2008", "1", "0"]]}]
+    assert d["samples"]["added"][0]["key"] == ["b3", "n3"] and d["samples"]["removed"][0]["key"] == ["b1", "n2"]
+    assert d["col_changes"] == {"y2008": 1}
 
 
 @pytest.mark.skipif(importlib.util.find_spec("polars") is None, reason="polars not installed")
 def test_row_diff_key_override_and_keyless_tables(tmp_path):
-    (tmp_path / "s.py").write_text("import valet_view as vv\nvv.key('usage.csv', ['cpsc', 'base'])\n" +
-                                   WRITE_USAGE.format(rows=[("b1", "010", 1, 0)]))
+    (tmp_path / "s.py").write_text("import valet_view as vv\nvv.key('usage.csv', ['nest', 'island'])\n" +
+                                   WRITE_USAGE.format(rows=[("b1", "n1", 1, 0)]))
     valet(tmp_path, "py", "s.py")
-    (tmp_path / "s.py").write_text(WRITE_USAGE.format(rows=[("b1", "010", 1, 1)]))
+    (tmp_path / "s.py").write_text(WRITE_USAGE.format(rows=[("b1", "n1", 1, 1)]))
     valet(tmp_path, "py", "s.py")
     d = _run_json(tmp_path, 2)["artifacts"][0]["diff"]
-    assert d["key"] == ["cpsc", "base"] and d["changed"] == 1     # the explicit key is remembered
+    assert d["key"] == ["nest", "island"] and d["changed"] == 1   # the explicit key is remembered
 
     # no unique leading columns: rows are compared as a multiset
     (tmp_path / "k.py").write_text("import polars as pl\npl.DataFrame({'a': [1, 1, 2]}).write_csv('dups.csv')\n")
@@ -712,3 +712,15 @@ def test_row_diff_never_compares_frame_and_csv_fingerprints_or_huge_tables(tmp_p
                PYTHONPATH=str(ROOT), VALET_DIFF_MAX_CELLS="1")
     subprocess.run([sys.executable, "-m", "valet", "py", "a.py"], cwd=tmp_path, env=env, capture_output=True)
     assert _run_json(tmp_path, 3)["artifacts"][0]["diff"] == {"skipped": "too big to diff"}
+
+
+def test_valet_view_bar_colors_are_grouped_and_scatter_axes_unzeroed(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "import valet_view as vv\n"
+        "rows = [{'species': s, 'sex': x, 'mass': m} for s in 'AB' for x in ('f', 'm') for m in (3000, 4000)]\n"
+        "vv.chart(rows, x='species', y='mass', agg='mean', color='sex', kind='bar')\n"
+        "vv.chart(rows, x='mass', y='mass', color='species', kind='point')\n")
+    assert valet(tmp_path, "py", "s.py").returncode == 0
+    bar, pts = [a["spec"]["encoding"] for a in _run_json(tmp_path, 1)["artifacts"]]
+    assert bar["xOffset"] == {"field": "sex"}          # side by side: stacked means would add up
+    assert pts["x"]["scale"] == {"zero": False} and pts["y"]["scale"] == {"zero": False}

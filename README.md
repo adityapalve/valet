@@ -40,6 +40,9 @@ the terminal exactly as before, so the agent's own terminal tool sees it, and on
 
 ![viewer](docs/viewer.png)
 
+*Screenshots show an agent session exploring the [Palmer Penguins](https://allisonhorst.github.io/palmerpenguins/)
+dataset (Horst, Hill & Gorman, data from Palmer Station LTER; CC0).*
+
 It has zero dependencies (stdlib Python ≥ 3.9, SQLite) and makes no network calls apart from
 the viewer on `127.0.0.1`, so it works behind a corporate VPN or proxy.
 
@@ -110,7 +113,7 @@ produced it, and merges draw a dashed edge from the second input:
   `unique`, `pivot`, `unpivot`, `explode`, `drop`, `drop_nulls`, `fill_null`, `rename`, and
   `LazyFrame.collect()` (with its query plan); `sort`, `cast`, `with_row_index` as minor nodes.
   Parameters are read from each method's real signature, with expressions shown as text, e.g.
-  `filter(col("base").str.starts_with("W5") | ...)`. Each step
+  `filter(col("species").is_in(["Adelie", "Gentoo"]) | ...)`. Each step
   stores its parameters (dedupe `subset`, join `on` / `how`, groupby keys…), input and output
   shapes, columns added and removed, and the calling line.
 - **The why:** the rules ask the agent to put a one-line `#` comment above each
@@ -194,7 +197,7 @@ that python process (or log out), then update.
   summaries" checkbox hides them. (CSV files found on disk get a preview but no profile.)
 - **Compared row by row to last time.** See below.
 - **Told to the agent.** The run summary lists the outputs, e.g.
-  `[valet] outputs: output/xcl_usage.csv (13,043 x 22)`.
+  `[valet] outputs: output/penguins_clean.csv (333 x 11)`.
 - Sorting and filtering apply to the preview rows (the first 200). Previews are stored in
   `.valet/`; set `VALET_TRAIL_PROFILE=0` to keep data out of it, or `VALET_MAX_ARTIFACTS` to change
   the per-run limit (default 20).
@@ -208,12 +211,12 @@ When a run writes an output it wrote before, valet says which rows were **added*
 
 - Rows are matched by a **key**: the shortest run of leading columns (up to 4) that is present and
   unique in both versions (last run's key is kept while it still works). Set it explicitly with
-  `vv.key("output/usage.csv", ["base", "cpsc"])`. Without a usable key, identical rows are matched
+  `vv.key("output/penguins_clean.csv", ["id"])`. Without a usable key, identical rows are matched
   as a multiset (a changed row then counts as one removed + one added).
 - It works for frames written through pandas/polars (compared in-process, from the full frame)
   and for CSV/TSV files written any other way. The two are fingerprinted separately, since they
   format values differently.
-- The agent sees it too: `[valet] outputs: output/xcl_usage.csv (8,065 x 23; +0 -21 ~1 rows vs run #13)`.
+- The agent sees it too: `[valet] outputs: output/penguins_clean.csv (230 x 11; +0 -103 ~42 rows vs run #2)`.
   The rules ask it to investigate changes it didn't intend.
 - To compare, valet keeps the previous version's rows in `.valet/fingerprints/` (one file per
   output path). Tables over 3M cells aren't diffed (`VALET_DIFF_MAX_CELLS`).
@@ -226,12 +229,12 @@ Every `valet py` run can `import valet_view` (valet puts it on the import path; 
 
 ```python
 import valet_view as vv
-vv.chart(df, x="vl", y="bases", kind="bar", sort="-y", title="Pairs per VL")
-vv.chart(df, x="month", y="revenue", kind="line", color="region")
-vv.chart(df, x="n_vls", kind="hist")                       # also: point, area, box, heatmap
-vv.chart(df, x="team", y="minutes", agg="median", kind="bar")
+vv.chart(df, x="bill_length_mm", y="bill_depth_mm", color="species", kind="point")
+vv.chart(df, x="species", y="body_mass_g", agg="mean", color="sex", kind="bar")
+vv.chart(df, x="flipper_length_mm", kind="hist")           # also: line, area, box, heatmap
+vv.chart(df, x="island", y="species", kind="heatmap")      # counts per cell
 vv.vega({...}, data=df)                                     # any Vega-Lite spec
-vv.table(df.head(20), "Most widely used parts")             # a titled table
+vv.table(df.head(20), "Heaviest birds")                     # a titled table
 ```
 
 - Charts are [Vega-Lite](https://vega.github.io/vega-lite/) specs, drawn in the viewer with
@@ -256,7 +259,7 @@ demand. Failed runs are tagged with the exception type in the sidebar.
 
 ### Run titles and snippets
 
-Each run gets a readable title in the viewer: `valet py --title "XCL usage check" ...`, otherwise
+Each run gets a readable title in the viewer: `valet py --title "Clean the penguins data" ...`, otherwise
 the script's leading `#` comment or docstring, otherwise (for `-c` snippets) its first meaningful
 statement. A one-line snippet like `import x; y = f(); print(y)` is saved one statement per line,
 but only when the reformatted code parses to exactly the same program; it is the version that runs.

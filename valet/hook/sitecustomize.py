@@ -115,16 +115,22 @@ def _call_site(f=None):
         return None
     fn, ln = f.f_code.co_filename, f.f_lineno
     code = linecache.getline(fn, ln).strip()
+    start = _stmt_start(fn, ln)
+    # a continuation line like `.agg(...)` says little; the statement's first line has the
+    # assignment (`summary = (df.group_by(...)`), so show that, and name the result from it
+    stmt = linecache.getline(fn, start).strip() if start != ln else code
+    if start != ln and code.startswith((".", ")")):
+        code = stmt
     comment = []
     # comments sit above the *statement*, which may start lines earlier (chained calls in parens)
-    i = _stmt_start(fn, ln) - 1
+    i = start - 1
     while i > 0 and len(comment) < 3:
         prev = linecache.getline(fn, i).strip()
         if not prev.startswith("#") or prev.startswith("# ///"):
             break
         comment.insert(0, prev.lstrip("#").strip())
         i -= 1
-    return {"file": fn, "line": ln, "code": code[:240], "comment": " ".join(comment) or None}
+    return {"file": fn, "line": ln, "code": code[:240], "stmt": stmt[:240], "comment": " ".join(comment) or None}
 
 
 def _shape(obj):
@@ -228,8 +234,9 @@ def _node_in(obj):
 
 
 def _out_label(site, inplace, parent):
-    code = (site or {}).get("code") or ""
-    m = (None if inplace else _ASSIGN_RE.match(code)) or _RECV_RE.match(code)
+    site = site or {}
+    code = site.get("code") or ""
+    m = (None if inplace else _ASSIGN_RE.match(site.get("stmt") or code)) or _RECV_RE.match(code)
     return m.group(1) if m else _labels.get(parent) or "frame"
 
 

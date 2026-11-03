@@ -87,9 +87,19 @@ def chart(data, x, y=None, kind="bar", color=None, title=None, agg=None, sort=No
             key = sort.lstrip("-")
             enc["x"]["sort"] = {"encoding": key, "order": "descending" if desc else "ascending"} \
                 if key in ("x", "y") else sort
+        if kind == "bar" and color:
+            # side by side, not stacked: stacked means/medians would add up to nonsense
+            enc["xOffset"] = {"field": color}
         if kind == "bar" and types.get(x) == "nominal" and len({r.get(x) for r in rows}) > 25:
             # many categories: horizontal bars read better
             enc["x"], enc["y"] = enc["y"], enc["x"]
+            if "xOffset" in enc:
+                enc["yOffset"] = enc.pop("xOffset")
+    if kind in ("point", "line", "tick"):
+        # zero baselines matter for bars and areas; for points and lines they squash the data
+        for ch in ("x", "y"):
+            if enc.get(ch, {}).get("type") == "quantitative" and "aggregate" not in enc[ch]:
+                enc[ch]["scale"] = {"zero": False}
     if tooltip:
         enc["tooltip"] = [field(t) for t in tooltip]
     spec = {"mark": mark, "encoding": enc, "data": {"values": rows}}
@@ -229,6 +239,8 @@ def _preaggregate(data, kind, x, y, color, agg):
         enc["y"] = {"field": vname, "type": "quantitative", "title": f"{agg} of {y}" if agg else "count"}
         if color:
             enc["color"] = {"field": color, "type": types.get(color, "nominal")}
+            if kind == "bar":   # side by side, not stacked (see above)
+                enc["xOffset"] = {"field": color}
         mark = {"type": kind, "tooltip": True}
         if kind == "line":
             mark["point"] = len(rows) <= 200

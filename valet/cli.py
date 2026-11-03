@@ -38,7 +38,7 @@ send you instructions through it. Follow these rules for this project:
   - a quick snippet: `valet py -c "..."`, or pipe the code in: in bash
     `valet py - <<'EOF' ... EOF`, in PowerShell `@' ... '@ | valet py -`
 - Give every run a short title saying what it's for, so the user can follow
-  along: `valet py --title "XCL usage check" script.py`. Anything longer than one
+  along: `valet py --title "Clean survey data" script.py`. Anything longer than one
   or two statements belongs in a script file in `.valet/scratch/`, one statement
   per line, not a long `-c` one-liner joined with `;`.
 - Run other commands you want the user to see (tests, data tools, CLIs) with
@@ -70,7 +70,7 @@ send you instructions through it. Follow these rules for this project:
   vv.chart(df, x="minutes", kind="hist")          # also: bar, point, area, box, heatmap
   vv.vega({...vega-lite spec...}, data=df)        # anything custom
   vv.table(df, "Top 20 users")                    # a titled table
-  vv.key("output/usage.csv", ["base", "cpsc"])    # how to match rows between runs
+  vv.key("output/clean.csv", ["id"])              # how to match rows between runs
   ```
   `df` can be pandas, polars or a list of dicts. Aggregate first: charts use at
   most 5,000 rows. Each call prints `[valet] chart: <title>` when it worked.
