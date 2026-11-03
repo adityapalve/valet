@@ -165,8 +165,9 @@ def execute(store: Store, argv: list[str], snapshot: list[Path] | None = None) -
     store.trail_path(run_id).unlink(missing_ok=True)
 
     trailer = f"\n[valet] run #{run_id} · exit {code}"
-    if steps:
-        trailer += f" · {len(steps)} dataframe steps recorded"
+    real = [st for st in steps if st["op"] != "source" and not st.get("minor")]
+    if real:
+        trailer += f" · {len(real)} dataframe steps recorded"
     warnings = [
         f"  - {w}  ({Path(st['site']['file']).name}:{st['site']['line']})" if st.get("site") else f"  - {w}"
         for st in steps for w in st.get("warnings") or []
@@ -270,6 +271,9 @@ def fmt_shape(shape) -> str:
 
 
 def format_step(st: dict) -> str:
+    node = st.get("node") or {}
+    if st["op"] == "source":
+        return f"source {node.get('label', '?')}  {fmt_shape(st.get('output'))}"
     params = ", ".join(f"{k}={v}" for k, v in (st.get("params") or {}).items())
     ins = " + ".join(fmt_shape(i.get("shape")) for i in st.get("inputs") or [])
     line = f"{st['op']}({params})  {ins + ' → ' if ins else ''}{fmt_shape(st.get('output'))}"
@@ -277,6 +281,8 @@ def format_step(st: dict) -> str:
         line += f"  +cols {st['cols_added']}"
     if st.get("cols_removed"):
         line += f"  -cols {st['cols_removed']}"
+    if node.get("label") and not node.get("sink"):
+        line += f"  => {node['label']}"
     if st.get("site"):
         line += f"  @{Path(st['site']['file']).name}:{st['site']['line']}"
     for w in st.get("warnings") or []:

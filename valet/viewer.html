@@ -36,7 +36,7 @@ button.ghost { background: transparent; color: var(--accent); }
 .chip { font-size: 12px; padding: 3px 8px; border-radius: 999px; background: var(--bg);
   border: 1px dashed var(--run); color: var(--ink); }
 .chip b { cursor: pointer; margin-left: 6px; color: var(--muted); }
-main { display: grid; grid-template-columns: minmax(220px, 320px) 1fr; min-height: 0; }
+main { display: grid; grid-template-columns: minmax(220px, 320px) minmax(0, 1fr); min-height: 0; }
 #runs { overflow: auto; border-right: 1px solid var(--line); background: var(--panel); }
 .run { padding: 8px 12px; border-bottom: 1px solid var(--line); cursor: pointer; }
 .run:hover { background: var(--bg); }
@@ -88,11 +88,40 @@ pre.code span { display: block; }
   padding: 4px 8px; font-size: 12.5px; }
 .badge-warn { font-size: 11px; color: var(--bad); margin-left: 6px; }
 @media (max-width: 700px) { .step { grid-template-columns: 1fr; } .step > * { grid-column: 1 !important; grid-row: auto !important; } }
+.tree { position: relative; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; }
+.tree svg.edges { position: absolute; inset: 0; pointer-events: none; overflow: visible; }
+.tnode { position: relative; padding: 8px 12px 8px var(--gutter); border-bottom: 1px solid var(--line); cursor: pointer; }
+.tnode:last-child { border-bottom: 0; }
+.tnode:hover { background: var(--bg); }
+.tnode.minor { padding-top: 3px; padding-bottom: 3px; font-size: 12px; color: var(--muted); }
+.gdot { position: absolute; top: 14px; width: 11px; height: 11px; margin-left: -5.5px; border-radius: 50%;
+  background: var(--lane); border: 2px solid var(--panel); box-shadow: 0 0 0 1px var(--lane); z-index: 1; }
+.tnode.minor .gdot { top: 9px; width: 7px; height: 7px; margin-left: -3.5px; }
+.tnode.source .gdot { background: var(--panel); border-color: var(--lane); box-shadow: none; }
+.tnode.sink .gdot { border-radius: 2px; }
+.tnode.warned .gdot { --lane: var(--bad); }
+.thead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.thead .label { font-family: var(--mono); font-weight: 600; font-size: 13px; }
+.thead .ver { font-family: var(--mono); font-size: 10.5px; color: var(--muted); margin-left: -7px; }
+.thead .loc { margin-left: auto; font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+.tnode .why { margin-top: 2px; }
+.tnode .code-line { font-family: var(--mono); font-size: 12px; color: var(--muted); overflow-wrap: anywhere; margin-top: 2px; }
+.tnode .warn { margin-top: 4px; background: var(--del-bg); color: var(--del); border-radius: 4px; padding: 4px 8px; font-size: 12.5px; }
+.preview { margin-top: 8px; overflow-x: auto; cursor: auto; border: 1px solid var(--line); border-radius: 4px; }
+.preview table { border-collapse: collapse; font-family: var(--mono); font-size: 12px; min-width: 100%; }
+.preview th, .preview td { padding: 3px 10px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line); }
+.preview th { background: var(--bg); position: sticky; top: 0; font-weight: 600; }
+.preview th.new { color: var(--add); }
+.preview .dtype { font-weight: 400; color: var(--muted); font-size: 11px; }
+.preview .nullbar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 3px; }
+.preview .nullbar i { display: block; height: 100%; background: var(--bad); border-radius: 2px; }
+.preview .nulltxt { font-weight: 400; font-size: 10.5px; color: var(--muted); }
+.legend { font-size: 11.5px; color: var(--muted); }
 .note-delivered { border-left: 3px solid var(--run); padding: 6px 10px; background: var(--panel);
   margin-top: 6px; border-radius: 0 6px 6px 0; }
 label.follow { font-size: 12px; color: var(--muted); display: flex; gap: 4px; align-items: center; }
 @media (max-width: 700px) {
-  main { grid-template-columns: 1fr; grid-template-rows: 35vh 1fr; }
+  main { grid-template-columns: minmax(0, 1fr); grid-template-rows: 35vh 1fr; }
   #runs { border-right: 0; border-bottom: 1px solid var(--line); }
 }
 </style>
@@ -164,7 +193,104 @@ function renderStep(st) {
     ${(st.warnings || []).map((w) => `<div class="warn">⚠ ${esc(w)}</div>`).join("")}
   </div>`;
 }
-function renderTrail(trail) {
+
+// ---- transformation tree ---------------------------------------------------------------
+const LANES = ["var(--accent)", "var(--hunk)", "var(--ok)", "var(--run)", "var(--bad)"];
+let openNodes = new Set();
+
+function layoutTree(trail) {
+  const rows = trail.filter((s) => s.out_node != null);
+  const pos = {}, lanes = [];
+  rows.forEach((s, i) => {
+    const parents = (s.in_nodes || []).filter((p) => pos[p]);
+    let lane = -1;
+    if (parents.length && lanes[pos[parents[0]].lane] === parents[0]) lane = pos[parents[0]].lane;
+    if (lane < 0) { lane = lanes.indexOf(null); if (lane < 0) { lane = lanes.length; lanes.push(null); } }
+    parents.slice(1).forEach((p) => { const l = pos[p].lane; if (lanes[l] === p) lanes[l] = null; });
+    lanes[lane] = s.node && s.node.sink ? null : s.out_node;
+    pos[s.out_node] = { lane, row: i };
+  });
+  return { rows, pos, width: Math.max(1, lanes.length) };
+}
+
+function deltaHtml(st) {
+  const ins = st.inputs || [];
+  const rin = ins[0] && ins[0].shape ? ins[0].shape[0] : null, rout = st.output ? st.output[0] : null;
+  if (rin === null || rout === null || rin === rout) return "";
+  const d = rout - rin, pct = rin ? Math.abs(100 * d / rin).toFixed(1) : "∞";
+  return `<span class="delta ${d < 0 ? "down" : "up"}">${d > 0 ? "+" : "−"}${Math.abs(d).toLocaleString()} rows (${pct}%)</span>`;
+}
+
+function previewHtml(st) {
+  const p = st.node && st.node.profile;
+  if (!p) return `<div class="preview meta" style="padding:8px">${st.node && st.node.sink ? "written to " + esc(st.node.label) : "no preview recorded"}</div>`;
+  const added = new Set(st.cols_added || []);
+  const rows = st.output ? st.output[0] : 0;
+  const head = p.columns.map((c, i) => {
+    const nulls = p.nulls ? p.nulls[i] : null, pct = nulls !== null && rows ? 100 * nulls / rows : 0;
+    const nullInfo = nulls === null ? "" : `<div class="nulltxt">${nulls ? pct.toFixed(1) + "% missing" : "no missing"}</div>
+      <div class="nullbar"><i style="width:${Math.min(100, pct)}%"></i></div>`;
+    return `<th class="${added.has(c) ? "new" : ""}">${esc(c)} <span class="dtype">${esc(p.dtypes[i])}</span>${nullInfo}</th>`;
+  }).join("");
+  const body = p.sample.map((r) => `<tr>${r.map((v) => `<td>${esc(v)}</td>`).join("")}</tr>`).join("");
+  const more = p.more_columns ? `<div class="meta" style="padding:4px 10px">+${p.more_columns} more columns</div>` : "";
+  return `<div class="preview"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>${more}</div>`;
+}
+
+function renderTree(trail, runId) {
+  const { rows, pos, width } = layoutTree(trail);
+  const gutter = 14 + width * 16;
+  const counts = {}, seen = {};
+  rows.forEach((s) => { const l = s.node.label; counts[l] = (counts[l] || 0) + 1; });
+  const html = rows.map((st) => {
+    const n = st.node, l = n.label, lane = pos[st.out_node].lane;
+    seen[l] = (seen[l] || 0) + 1;
+    const ver = counts[l] > 1 && !n.sink ? `<span class="ver">v${seen[l]}</span>` : "";
+    const site = st.site || {};
+    const kind = st.op === "source" ? "source" : n.sink ? "sink" : st.minor ? "minor" : "";
+    const params = Object.entries(st.params || {}).map(([k, v]) => `${k}=${v}`).join(", ");
+    const cols = [...(st.cols_added || []).map((c) => `<span class="colchip add">+${esc(c)}</span>`),
+                  ...(st.cols_removed || []).map((c) => `<span class="colchip rm">−${esc(c)}</span>`)].join("");
+    const key = runId + ":" + st.out_node;
+    const warned = (st.warnings || []).length ? "warned" : "";
+    const shape = n.sink ? "" : `<span class="shapes">${fmtShape(st.output)}</span>${deltaHtml(st)}`;
+    const opLabel = st.op === "source" ? "in memory" : st.op;
+    return `<div class="tnode ${kind} ${warned}" data-node="${esc(key)}" style="--gutter:${gutter}px; --lane:${LANES[lane % LANES.length]}">
+      <span class="gdot" data-n="${st.out_node}" style="left:${14 + lane * 16}px"></span>
+      <div class="thead"><span class="label">${esc(l)}</span>${ver}
+        <span class="op ${opKind(st.op)}" title="${esc(params)}">${esc(opLabel)}</span>${shape} ${cols}
+        <span class="loc">${site.file ? esc(site.file.split(/[\\/]/).pop() + ":" + site.line) : ""}</span></div>
+      ${!st.minor && site.comment ? `<div class="why">${esc(site.comment)}</div>` : ""}
+      ${!st.minor && site.code ? `<div class="code-line">${esc(site.code)}</div>` : ""}
+      ${(st.warnings || []).map((w) => `<div class="warn">⚠ ${esc(w)}</div>`).join("")}
+      ${openNodes.has(key) ? previewHtml(st) : ""}
+    </div>`;
+  }).join("");
+  const edges = rows.flatMap((st) => (st.in_nodes || []).filter((p) => pos[p])
+    .map((p, i) => ({ from: p, to: st.out_node, secondary: i > 0 })));
+  return { html: `<div class="tree" id="tree" data-edges="${esc(JSON.stringify(edges))}"><svg class="edges"></svg>${html}</div>` };
+}
+
+function drawEdges() {
+  const tree = document.getElementById("tree"); if (!tree) return;
+  const svg = tree.querySelector("svg.edges"), box = tree.getBoundingClientRect();
+  const at = {};
+  tree.querySelectorAll(".gdot").forEach((d) => {
+    const r = d.getBoundingClientRect();
+    at[d.dataset.n] = { x: r.left + r.width / 2 - box.left, y: r.top + r.height / 2 - box.top,
+                        color: getComputedStyle(d).getPropertyValue("--lane") };
+  });
+  svg.setAttribute("width", box.width); svg.setAttribute("height", box.height);
+  svg.innerHTML = JSON.parse(tree.dataset.edges).map((e) => {
+    const a = at[e.from], b = at[e.to]; if (!a || !b) return "";
+    const d = a.x === b.x ? `M${a.x},${a.y} V${b.y}`
+      : `M${a.x},${a.y} V${b.y - 18} C${a.x},${b.y - 6} ${b.x},${b.y - 12} ${b.x},${b.y}`;
+    return `<path d="${d}" fill="none" stroke="${b.color}" stroke-width="2" ${e.secondary ? 'stroke-dasharray="4 3"' : ""} opacity=".85"/>`;
+  }).join("");
+}
+new ResizeObserver(() => drawEdges()).observe(document.body);
+
+function renderTrail(trail, runId) {
   if (!trail || !trail.length) return "";
   const loads = trail.filter((s) => s.op.startsWith("read:"));
   const writes = trail.filter((s) => s.op.startsWith("write:"));
@@ -175,8 +301,12 @@ function renderTrail(trail) {
     writes.length ? "out: " + writes.map(io).join(", ") : "",
     nw ? `<span class="badge-warn">⚠ ${nw} warning${nw > 1 ? "s" : ""}</span>` : "",
   ].filter(Boolean).join(" &nbsp;·&nbsp; ");
-  return `<h2>data trail <span class="meta">${trail.length} steps</span></h2>
-    <div class="trail">${sum ? `<div class="trail-sum">${sum}</div>` : ""}${trail.map(renderStep).join("")}</div>`;
+  const real = trail.filter((s) => s.op !== "source" && !s.minor).length;
+  const hasTree = trail.some((s) => s.out_node != null);
+  const body = hasTree ? renderTree(trail, runId).html
+    : `<div class="trail">${trail.map(renderStep).join("")}</div>`;  // runs recorded before lineage
+  return `<h2>data trail <span class="meta">${real} steps${hasTree ? " · click a node to preview its data" : ""}</span></h2>
+    ${sum ? `<div class="trail-sum" style="border:0;padding:0 0 6px">${sum}</div>` : ""}${body}`;
 }
 
 function renderFile(f, runId, cwd) {
@@ -198,7 +328,7 @@ async function loadDetail(force) {
   if (selected === null) return;
   const r = await (await fetch(`/api/runs/${selected}`)).json();
   if (r.error) return;
-  const key = JSON.stringify([r.id, r.exit_code, r.output.length, (r.trail || []).length, fileView]);
+  const key = JSON.stringify([r.id, r.exit_code, r.output.length, (r.trail || []).length, fileView, [...openNodes]]);
   if (!force && key === lastDetailKey) return;
   lastDetailKey = key;
   const outEl = document.getElementById("out");
@@ -209,10 +339,11 @@ async function loadDetail(force) {
       ${r.exit_code === null ? "running…" : "exit " + r.exit_code} ${r.duration != null ? "· " + r.duration.toFixed(1) + "s" : ""} · ${esc(r.cwd)}</div>
     <div class="cmdline">$ ${esc(r.argv.join(" "))}</div>
     ${r.files.map((f) => renderFile(f, r.id, r.cwd)).join("")}
-    ${renderTrail(r.trail)}
+    ${renderTrail(r.trail, r.id)}
     <h2>output ${r.truncated ? '<span class="meta">(truncated)</span>' : ""}</h2>
     <pre class="code" id="out">${esc(r.output) || '<span class="meta">(no output)</span>'}</pre>
     ${r.notes.map((n) => `<div class="note-delivered"><b>delivered to agent:</b> ${esc(n.text)}</div>`).join("")}`;
+  drawEdges();
   const o = document.getElementById("out");
   if (atBottom || r.exit_code === null) o.scrollTop = o.scrollHeight;
 }
@@ -237,6 +368,12 @@ $("#runs").addEventListener("click", (e) => {
   selected = +el.dataset.id; $("#follow").checked = false; tick();
 });
 $("#detail").addEventListener("click", (e) => {
+  const t = e.target.closest(".tnode");
+  if (t && !e.target.closest(".preview")) {
+    const k = t.dataset.node;
+    openNodes.has(k) ? openNodes.delete(k) : openNodes.add(k);
+    loadDetail(true); return;
+  }
   const b = e.target.closest("button[data-view]"); if (!b) return;
   fileView[b.dataset.key] = b.dataset.view; loadDetail(true);
 });

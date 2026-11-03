@@ -6,6 +6,11 @@ its key parameters, input and output shapes, columns added or removed, the line 
 code that made the call (plus any `#` comment right above it), and warnings such as a
 join that multiplied rows.
 
+Lineage: every frame valet sees gets a node id (tracked by object identity via weakrefs,
+never by mutating the frame), so each step links its input nodes to its output node and
+the viewer can draw the transformation tree. Each output node carries a small profile:
+column dtypes, null counts and the first rows, for a Data Wrangler-style preview.
+
 This file must stay stdlib-only and self-contained: it also runs inside environments
 (e.g. `uv run --script`) where valet itself is not installed. Recording never raises
 into user code.
@@ -16,13 +21,24 @@ import importlib.util
 import json
 import linecache
 import os
+import re
 import sys
 import threading
+import weakref
 
 _TRAIL = os.environ.get("VALET_TRAIL")
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _state = threading.local()
 _lock = threading.Lock()
+_PROFILE = os.environ.get("VALET_TRAIL_PROFILE", "1") != "0"
+_NULL_CELL_LIMIT = 5_000_000   # skip null counting on frames bigger than this
+_PANDAS_DIR = os.sep + "pandas" + os.sep
+_registry = {}                 # id(frame) -> (weakref, node id)
+_labels = {}                   # node id -> variable name
+_counter = [0]
+# ops that matter for lineage but are not transformations worth a line of their own
+_MINOR = {"reset_index", "set_index", "sort_values", "sort_index", "copy", "astype",
+          "rename_axis", "convert_dtypes", "reindex"}
 
 
 def _emit(rec):
@@ -48,8 +64,8 @@ def _short(v, limit=120):
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
-def _call_site():
-    """First frame outside pandas/numpy/site-packages/this hook: (file, line, code, comment)."""
+def _user_frame():
+    """First frame outside pandas/numpy/site-packages/this hook."""
     f = sys._getframe(1)
     while f is not None:
         fn = f.f_code.co_filename
@@ -62,6 +78,12 @@ def _call_site():
         ):
             break
         f = f.f_back
+    return f
+
+
+def _call_site(f=None):
+    """(file, line, code, comment) of the user code that made the current call."""
+    f = f or _user_frame()
     if f is None:
         return None
     fn, ln = f.f_code.co_filename, f.f_lineno
@@ -88,6 +110,92 @@ def _cols(obj):
         return [str(c) for c in cols] if cols is not None and len(cols) <= 500 else None
     except Exception:
         return None
+
+
+# ---- lineage nodes --------------------------------------------------------------------
+
+_ASSIGN_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*(?::[^=]*)?=(?!=)")
+_RECV_RE = re.compile(r"^\s*([A-Za-z_]\w*)\s*[.\[]")
+
+
+def _new_id():
+    _counter[0] += 1
+    return _counter[0]
+
+
+def _register(obj):
+    nid = _new_id()
+    try:
+        _registry[id(obj)] = (weakref.ref(obj), nid)
+    except TypeError:
+        pass
+    return nid
+
+
+def _lookup(obj):
+    ent = _registry.get(id(obj))
+    return ent[1] if ent is not None and ent[0]() is obj else None
+
+
+def _cell(v):
+    s = str(v)
+    return s if len(s) <= 40 else s[:39] + "…"
+
+
+def _profile(obj):
+    """Small Data Wrangler-style summary: dtypes, null counts, first rows (≤40 columns)."""
+    if not _PROFILE:
+        return None
+    prev = getattr(_state, "busy", False)
+    _state.busy = True
+    try:
+        df = obj.to_frame() if getattr(obj, "ndim", 2) == 1 else obj
+        sub = df.iloc[:, :40]
+        prof = {
+            "columns": [str(c) for c in sub.columns],
+            "dtypes": [str(t) for t in sub.dtypes],
+            "more_columns": max(0, df.shape[1] - 40),
+        }
+        if df.shape[0] * sub.shape[1] <= _NULL_CELL_LIMIT:
+            prof["nulls"] = [int(x) for x in sub.isna().sum().tolist()]
+        prof["sample"] = [[_cell(v) for v in row] for row in sub.head(5).itertuples(index=False, name=None)]
+        return prof
+    except Exception:
+        return None
+    finally:
+        _state.busy = prev
+
+
+def _label_from_locals(obj, frame):
+    try:
+        for k, v in frame.f_locals.items():
+            if v is obj and not k.startswith("_"):
+                return k
+    except Exception:
+        pass
+    return None
+
+
+def _node_in(obj):
+    """Node id for an input frame; frames valet has not seen become root ('source') nodes."""
+    nid = _lookup(obj)
+    if nid is not None:
+        return nid
+    nid = _register(obj)
+    frame = _user_frame()
+    label = (_label_from_locals(obj, frame) if frame else None) or (
+        "series" if getattr(obj, "ndim", 2) == 1 else "frame")
+    _labels[nid] = label
+    _emit({"op": "source", "params": {}, "inputs": [], "in_nodes": [], "output": _shape(obj),
+           "out_node": nid, "node": {"id": nid, "label": label, "profile": _profile(obj)},
+           "site": None, "warnings": []})
+    return nid
+
+
+def _out_label(site, inplace, parent):
+    code = (site or {}).get("code") or ""
+    m = (None if inplace else _ASSIGN_RE.match(code)) or _RECV_RE.match(code)
+    return m.group(1) if m else _labels.get(parent) or "frame"
 
 
 def _frames_in(args, kwargs):
@@ -170,7 +278,7 @@ def _warnings(op, params, inputs, out_shape):
     return w
 
 
-def _record(op, args, kwargs, before, result, extra=None):
+def _record(op, args, kwargs, before, result, extra=None, inplace=False):
     site = _call_site()
     out_shape = _shape(result)
     if out_shape is None and before:  # inplace=True: the first input was mutated
@@ -182,9 +290,18 @@ def _record(op, args, kwargs, before, result, extra=None):
         "op": op,
         "params": params,
         "inputs": [{"shape": b["shape"], "cols": b["cols"]} for b in before],
+        "in_nodes": [b.get("node") for b in before],
         "output": out_shape,
         "site": site,
     }
+    if op in _MINOR:
+        rec["minor"] = True
+    if result is not None and out_shape is not None:
+        nid = _register(result)
+        label = _out_label(site, inplace, rec["in_nodes"][0] if rec["in_nodes"] else None)
+        _labels[nid] = label
+        rec["out_node"] = nid
+        rec["node"] = {"id": nid, "label": label, "profile": _profile(result)}
     out_cols = _cols(result) if result is not None else None
     if op.startswith("groupby."):
         # keys move into the index, so added/removed columns would be misleading
@@ -205,13 +322,13 @@ def _wrap(owner, name, op=None, inputs=None):
 
     @functools.wraps(orig)
     def wrapper(*args, **kwargs):
-        if getattr(_state, "busy", False):
+        if getattr(_state, "busy", False) or _PANDAS_DIR in sys._getframe(1).f_code.co_filename:
             return orig(*args, **kwargs)
         try:
             frames = inputs(args, kwargs) if inputs else _frames_in(args, kwargs)
             if op not in ("merge", "join", "concat"):
                 frames = frames[:1]
-            before = [{"shape": _shape(f), "cols": _cols(f)} for f in frames]
+            before = [{"shape": _shape(f), "cols": _cols(f), "node": _node_in(f)} for f in frames]
         except Exception:
             frames, before = [], []
         _state.busy = True
@@ -222,7 +339,7 @@ def _wrap(owner, name, op=None, inputs=None):
         try:
             if result is None and frames:  # inplace
                 before[0]["after_shape"] = _shape(frames[0])
-                _record(op, args, kwargs, before, frames[0])
+                _record(op, args, kwargs, before, frames[0], inplace=True)
             else:
                 _record(op, args, kwargs, before, result)
         except Exception:
@@ -240,8 +357,14 @@ def _wrap_io(module, name, kind):
 
     @functools.wraps(orig)
     def wrapper(*args, **kwargs):
-        if getattr(_state, "busy", False):
+        if getattr(_state, "busy", False) or _PANDAS_DIR in sys._getframe(1).f_code.co_filename:
             return orig(*args, **kwargs)
+        in_node = None
+        if kind == "write" and args:
+            try:
+                in_node = _node_in(args[0])
+            except Exception:
+                pass
         _state.busy = True
         try:
             result = orig(*args, **kwargs)
@@ -251,15 +374,28 @@ def _wrap_io(module, name, kind):
             target = args[1] if kind == "write" and len(args) > 1 else (args[0] if args else None)
             target = kwargs.get("path_or_buf", kwargs.get("path", kwargs.get("filepath_or_buffer", target)))
             obj = args[0] if kind == "write" else result
-            _emit({
+            site = _call_site()
+            rec = {
                 "op": f"{kind}:{name.replace('read_', '').replace('to_', '')}",
                 "params": {"source" if kind == "read" else "target": _short(target, 200)},
                 "inputs": [],
+                "in_nodes": [in_node] if in_node else [],
                 "output": _shape(obj),
                 "cols": _cols(obj) if kind == "read" else None,
-                "site": _call_site(),
+                "site": site,
                 "warnings": [],
-            })
+            }
+            if kind == "read" and _shape(result) is not None:
+                nid = _register(result)
+                _labels[nid] = _out_label(site, False, None)
+                rec["out_node"] = nid
+                rec["node"] = {"id": nid, "label": _labels[nid], "profile": _profile(result)}
+            elif kind == "write":
+                nid = _new_id()
+                tgt = os.path.basename(str(target)) if isinstance(target, (str, os.PathLike)) else name
+                rec["out_node"] = nid
+                rec["node"] = {"id": nid, "label": tgt, "sink": True}
+            _emit(rec)
         except Exception:
             pass
         return result
@@ -278,6 +414,9 @@ def _patch_pandas(pd):
     for name in ("merge", "join", "drop_duplicates", "dropna", "drop", "query", "pivot",
                  "pivot_table", "melt", "explode", "assign", "rename", "fillna"):
         _wrap(DF, name)
+    for name in sorted(_MINOR):
+        _wrap(DF, name)
+    _wrap_setitem(DF)
     _wrap(pd, "merge")
     _wrap(pd, "concat")
     for name in ("read_csv", "read_parquet", "read_excel", "read_json", "read_sql",
@@ -307,6 +446,37 @@ def _patch_pandas(pd):
         pass
 
 
+def _wrap_setitem(DF):
+    """df["col"] = ...: an in-place change, recorded as a new version of the same frame."""
+    orig = DF.__setitem__
+    if getattr(orig, "_valet", False):
+        return
+
+    @functools.wraps(orig)
+    def wrapper(self, key, value):
+        if getattr(_state, "busy", False) or _PANDAS_DIR in sys._getframe(1).f_code.co_filename:
+            return orig(self, key, value)
+        try:
+            cols = _cols(self)
+            before = [{"shape": _shape(self), "cols": cols, "node": _node_in(self)}]
+        except Exception:
+            cols, before = None, []
+        _state.busy = True
+        try:
+            orig(self, key, value)
+        finally:
+            _state.busy = False
+        try:
+            existed = cols is not None and str(key) in cols
+            _record("replace column" if existed else "add column", (), {}, before, self,
+                    extra={"column": _short(key)}, inplace=True)
+        except Exception:
+            pass
+
+    wrapper._valet = True
+    DF.__setitem__ = wrapper
+
+
 def _wrap_groupby(G, name):
     orig = getattr(G, name, None)
     if orig is None or getattr(orig, "_valet", False):
@@ -314,8 +484,13 @@ def _wrap_groupby(G, name):
 
     @functools.wraps(orig)
     def wrapper(self, *args, **kwargs):
-        if getattr(_state, "busy", False):
+        if getattr(_state, "busy", False) or _PANDAS_DIR in sys._getframe(1).f_code.co_filename:
             return orig(self, *args, **kwargs)
+        try:
+            obj = getattr(self, "obj", None)
+            in_node = _node_in(obj) if obj is not None else None
+        except Exception:
+            in_node = None
         _state.busy = True
         try:
             result = orig(self, *args, **kwargs)
@@ -329,7 +504,7 @@ def _wrap_groupby(G, name):
                 extra["func"] = _short(args[0])
             elif kwargs:
                 extra["func"] = _short(kwargs)
-            before = [{"shape": _shape(obj), "cols": _cols(obj)}]
+            before = [{"shape": _shape(obj), "cols": _cols(obj), "node": in_node}]
             _record(f"groupby.{name}", (), {}, before, result, extra=extra)
         except Exception:
             pass
@@ -344,24 +519,25 @@ def _wrap_filter(owner, name, get_frame, loc=False):
     if getattr(orig, "_valet", False):
         return
 
-    pandas_dir = os.sep + "pandas" + os.sep
-
     @functools.wraps(orig)
     def wrapper(self, key):
         # cheap path for the very common column access, and for pandas' internal calls
         if getattr(_state, "busy", False) or not _is_bool_mask(key[0] if loc and isinstance(key, tuple) and key else key) \
-                or pandas_dir in sys._getframe(1).f_code.co_filename:
+                or _PANDAS_DIR in sys._getframe(1).f_code.co_filename:
             return orig(self, key)
+        try:
+            frame = get_frame(self)
+            in_node = _node_in(frame)
+        except Exception:
+            frame, in_node = None, None
         _state.busy = True
         try:
             result = orig(self, key)
         finally:
             _state.busy = False
         try:
-            k = key[0] if loc and isinstance(key, tuple) and key else key
-            if _is_bool_mask(k) and _shape(result) is not None and getattr(result, "ndim", 0) == 2:
-                frame = get_frame(self)
-                before = [{"shape": _shape(frame), "cols": _cols(frame)}]
+            if frame is not None and _shape(result) is not None and getattr(result, "ndim", 0) == 2:
+                before = [{"shape": _shape(frame), "cols": _cols(frame), "node": in_node}]
                 _record("loc filter" if loc else "filter", (), {}, before, result)
         except Exception:
             pass

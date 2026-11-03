@@ -159,9 +159,10 @@ def test_data_trail_records_pandas_steps(tmp_path):
     assert "join fan-out" in r.stdout and "(p.py:8)" in r.stdout  # warning reaches the agent
 
     run = _run_json(tmp_path, 1)
-    ops = [s["op"] for s in run["trail"]]
-    assert ops == ["drop_duplicates", "filter", "merge", "dropna", "groupby.size"]
-    dedupe, filt, merge, dropna, _ = run["trail"]
+    sources = [s for s in run["trail"] if s["op"] == "source"]
+    steps = [s for s in run["trail"] if s["op"] != "source"]
+    assert [s["op"] for s in steps] == ["drop_duplicates", "filter", "merge", "dropna", "groupby.size"]
+    dedupe, filt, merge, dropna, _ = steps
     assert dedupe["params"]["subset"] == "['event_id']"
     assert dedupe["inputs"][0]["shape"] == [5, 2] and dedupe["output"] == [4, 2]
     assert dedupe["site"]["comment"] == "one row per event"
@@ -205,3 +206,33 @@ def _run_json(tmp_path, run_id):
         return run
     finally:
         sys.path.remove(str(ROOT))
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pandas") is None, reason="pandas not installed")
+def test_lineage_tree_and_profiles(tmp_path):
+    (tmp_path / "p.py").write_text(PIPELINE + 'out["big"] = out["event_id"] * 10\n')
+    assert valet(tmp_path, "py", "p.py").returncode == 0
+    trail = _run_json(tmp_path, 1)["trail"]
+    by_out = {s["out_node"]: s for s in trail if s.get("out_node")}
+    label = lambda nid: by_out[nid]["node"]["label"]
+
+    # frames built in user code become labelled roots
+    roots = [s for s in trail if s["op"] == "source"]
+    assert sorted(s["node"]["label"] for s in roots) == ["events", "users"]
+
+    merge = next(s for s in trail if s["op"] == "merge")
+    left, right = merge["in_nodes"]
+    assert by_out[left]["op"] == "filter" and label(left) == "events"
+    assert by_out[right]["op"] == "source" and label(right) == "users"
+    assert label(merge["out_node"]) == "out"
+
+    # in-place ops and column assignment create new versions chained to the previous one
+    dropna = next(s for s in trail if s["op"] == "dropna")
+    assert dropna["in_nodes"] == [merge["out_node"]] and label(dropna["out_node"]) == "out"
+    setcol = next(s for s in trail if s["op"] == "add column")
+    assert setcol["params"]["column"] == "'big'" and setcol["cols_added"] == ["big"]
+    assert setcol["in_nodes"] == [dropna["out_node"]]  # groupby read `out` but did not replace it
+
+    prof = merge["node"]["profile"]
+    assert prof["columns"] == ["event_id", "user_id", "region"]
+    assert prof["nulls"] == [0, 0, 0] and len(prof["sample"]) == 5

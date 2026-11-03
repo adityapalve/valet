@@ -15,9 +15,11 @@ the terminal exactly as before, so the agent's own terminal tool sees it, and on
 - **You can steer**: type a message in the viewer (or `valet note "..."`), and it is appended
   to the output of the agent's *next* run as `[valet] Message from the user`. The agent's
   rules tell it to treat that as a direct instruction.
-- **A data trail for pandas**: every DataFrame transformation is recorded with its shape before
-  and after, the keys it used, the line of code, and the `#` comment above it explaining why.
-  Joins that multiply rows are flagged, to you *and* to the agent.
+- **A transformation tree for pandas**: every DataFrame transformation is recorded with its shape
+  before and after, the keys it used, the line of code, and the `#` comment above it explaining
+  why, and linked into a tree of which frame came from which. Click any node for a Data
+  Wrangler-style preview (column types, % missing, sample rows). Joins that multiply rows are
+  flagged, to you *and* to the agent.
 - **A live viewer**: `valet ui` serves a local page showing the run timeline, script
   diffs, the data trail, streaming output and queued notes.
 
@@ -59,21 +61,32 @@ paste the same text (`valet/cli.py: RULES`) into their rules or `AGENTS.md`.
 | `valet log` / `valet show [id] [--full]` | browse runs from the terminal |
 | `valet ui [--port N]` | live viewer |
 
-### Data trail
+### Data trail and transformation tree
 
 When a script run through valet imports pandas, valet records each transformation, with no
-change to the code:
+change to the code, and draws them as a tree. Each node is a version of a DataFrame, named after
+the variable it was assigned to (`events v1 → v2 → v3`). Each edge is the operation that
+produced it, and merges draw a dashed edge from the second input:
 
 ![data trail](docs/trail.png)
 
 - **Recorded:** `read_*` / `to_*`, `merge` / `join` / `concat`, `drop_duplicates`, `dropna`,
   `drop`, `query`, boolean-mask filters (`df[mask]`, `df.loc[mask]`), `assign`, `rename`,
-  `fillna`, `pivot` / `pivot_table` / `melt` / `explode`, and groupby aggregations. Each step
+  `fillna`, `pivot` / `pivot_table` / `melt` / `explode`, column assignment (`df["x"] = …`), and
+  groupby aggregations. `reset_index`, `sort_values`, `astype`, `copy` and similar are recorded
+  as small "minor" nodes so the tree stays connected. Each step
   stores its parameters (dedupe `subset`, join `on` / `how`, groupby keys…), input and output
   shapes, columns added and removed, and the calling line.
 - **The why:** the rules ask the agent to put a one-line `#` comment above each
   transformation. valet shows that comment as the step's description, so the trail reads like
   "one row per event_id: 5,300 → 5,000 rows".
+- **Lineage:** frames are tracked by object identity (weak references; the frames themselves are
+  never modified), so a step's inputs link to the nodes that produced them. Frames valet didn't
+  see being created (e.g. built with `pd.DataFrame(...)`) become root nodes named after their
+  variable.
+- **Previews:** each node stores the first 5 rows, column dtypes and null counts (≤40 columns;
+  nulls skipped above 5M cells). This is a copy of your data in `.valet/` (which `valet init`
+  gitignores). Set `VALET_TRAIL_PROFILE=0` to record shapes only.
 - **Warnings:** a left or inner join that *adds* rows (duplicate keys on the right), an inner join
   that drops rows, concat inputs with mismatched columns, or a step that empties the frame. These
   are also printed at the end of the run as `[valet] Data warnings`, so the agent sees them too.
@@ -129,7 +142,8 @@ command's output is the most reliable channel available.
   crashed or reset session (or kernel) can be rebuilt with `valet replay --until 12`. Optionally,
   checkpoint DataFrames to parquet at chosen steps so replay can resume from there.
 - **Data trail, more**: polars support; null-rate and key-uniqueness checks on join keys;
-  linking steps into a DAG (which frame came from which).
+  `df.loc[mask, col] = …` updates; collapsing long runs of column assignments; a tree that spans
+  runs (follow `report.csv` from the script that wrote it into the one that reads it).
 - **Optional MCP front-end** over the same store, for agents/IDEs where MCP is available.
 - **Workspace diffs**: also record files the scripts *wrote*, not just the ones they ran.
   Zed's DeltaDB (operation-level history, private beta as of late 2026) is worth watching here.
