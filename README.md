@@ -8,8 +8,11 @@ overwritten, the output scrolls away, and you can't redirect the agent until its
 the terminal exactly as before, so the agent's own terminal tool sees it, and on top of that:
 
 - **Every run is recorded**: command, working directory, exit code, duration, full output.
-- **Every script version is kept**: each run snapshots the files it executed, so you can
-  diff run #7's `inspect.py` against run #6's even though the agent overwrote it.
+- **Every script version is kept, and easy to review**: each run snapshots the files it executed.
+  The viewer shows each script as a syntax-highlighted split or unified diff against the previous
+  run *or* against its first version (everything the agent changed this session), with word-level
+  highlights and unchanged regions collapsed. Rendering uses
+  [@pierre/diffs](https://diffs.com), the open-source library behind DiffsHub.
 - **Inline code becomes durable**: `valet py -c "..."` and heredocs are saved to
   `.valet/scratch/` before they run.
 - **You can steer**: type a message in the viewer (or `valet note "..."`), and it is appended
@@ -153,6 +156,21 @@ error paths) queries stayed open, so the viewer held a write lock for as long as
 closes it. The test suite checks this under PyPy too. If an old viewer is still running, end
 that python process (or log out), then update.
 
+### Reviewing scripts
+
+![script diff](docs/scripts.png)
+
+Each script header shows its version (`v3`), lines added and removed, and three views: **changes
+vs the previous run**, **vs the first version** in this project, and the **full file**. The
+split/unified and wrap settings are remembered in your browser; narrow screens always use unified.
+Python, SQL, shell, JSON, YAML, TOML, Markdown and R are highlighted; other files are shown as
+plain text.
+
+The renderer is bundled in the package (`valet/static/diffs.js`, ~1 MB) and served by the viewer
+itself, so it works offline and behind networks that block CDNs. It is built from pinned versions
+by `tools/build-diffs` (see below); third-party licenses are in
+`valet/static/THIRD_PARTY_LICENSES.txt`.
+
 ## Design notes
 
 **Why a CLI wrapper rather than an MCP server?** The agent's built-in terminal tool can't be
@@ -184,3 +202,20 @@ command's output is the most reliable channel available.
 - **Optional MCP front-end** over the same store, for agents/IDEs where MCP is available.
 - **Workspace diffs**: also record files the scripts *wrote*, not just the ones they ran.
   Zed's DeltaDB (operation-level history, private beta as of late 2026) is worth watching here.
+
+## Developing
+
+```bash
+python -m pytest -q
+```
+
+To rebuild the bundled diff renderer (only needed when upgrading `@pierre/diffs`; requires Node):
+
+```bash
+cd tools/build-diffs && npm ci && node build.mjs
+```
+
+The build keeps only the grammars valet highlights and Pierre's own light/dark themes, and stubs
+out the WASM highlighter backends, taking the bundle from ~11 MB to ~1 MB. `@pierre/diffs` 1.6.0
+fails to load themes with the `@pierre/theming` version it pins; 1.6.1 is the first release that
+works.

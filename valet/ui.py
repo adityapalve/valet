@@ -32,6 +32,8 @@ from urllib.parse import urlparse
 from .store import Store
 
 UI_FILE = "ui.json"
+# Bundled, served from the package so the viewer works offline (no CDN; corp networks often block them).
+STATIC = {"diffs.js": "text/javascript; charset=utf-8", "THIRD_PARTY_LICENSES.txt": "text/plain; charset=utf-8"}
 DEFAULT_IDLE_MINUTES = 30.0
 _no_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # corp proxies: never for localhost
 
@@ -216,6 +218,8 @@ def serve(store: Store, port: int = 8765, open_browser: bool = True,
             path = urlparse(self.path).path
             if path == "/":
                 return self._send(page, "text/html; charset=utf-8")
+            if path.startswith("/static/") and path[8:] in STATIC:
+                return self._send(files("valet").joinpath("static", path[8:]).read_bytes(), STATIC[path[8:]])
             if path == "/api/ping":
                 return self._json({"home": str(store.home.resolve()), "pid": os.getpid()})
             try:

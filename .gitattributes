@@ -1,2 +1,3 @@
 *.cmd text eol=crlf
 bin/valet text eol=lf
+valet/static/diffs.js linguist-generated=true -diff

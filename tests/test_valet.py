@@ -365,3 +365,30 @@ def test_viewer_rejects_cross_site_requests(tmp_path):
     finally:
         proc.terminate()
         proc.wait()
+
+
+def test_script_versions_and_bundled_diff_renderer(tmp_path):
+    script = tmp_path / "s.py"
+    for body in ("print(1)\n", "print(2)\n", "print(3)\nprint(4)\n"):
+        script.write_text(body)
+        assert valet(tmp_path, "py", "s.py").returncode == 0
+    f = _run_json(tmp_path, 3)["files"][0]
+    assert f["version"] == 3 and f["prev_run"] == 2 and f["first_run"] == 1
+    assert f["prev_content"] == "print(2)\n" and f["first_content"] == "print(1)\n"
+    assert "-print(1)" in f["first_diff"] and "+print(4)" in f["first_diff"]
+    assert _run_json(tmp_path, 2)["files"][0]["first_run"] is None  # previous == first: no separate view
+
+    env = _env(tmp_path)
+    proc = subprocess.Popen([sys.executable, "-m", "valet", "ui", "--foreground", "--port", "8836",
+                             "--no-browser"], cwd=tmp_path, env=env, stdout=subprocess.PIPE)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        proc.stdout.readline()
+        r = opener.open("http://127.0.0.1:8836/static/diffs.js")
+        assert r.headers["Content-Type"].startswith("text/javascript") and len(r.read()) > 100_000
+        assert b"Apache License" in opener.open("http://127.0.0.1:8836/static/THIRD_PARTY_LICENSES.txt").read()
+        with pytest.raises(urllib.error.HTTPError):
+            opener.open("http://127.0.0.1:8836/static/../store.py")
+    finally:
+        proc.terminate()
+        proc.wait()

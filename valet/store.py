@@ -162,14 +162,29 @@ class Store:
                                     "WHERE f.path = ? AND f.run_id < ? ORDER BY f.run_id DESC LIMIT 1",
                                (f["path"], run_id))
                 prev = prev_rows[0] if prev_rows else None
+                first_rows = _q(con, "SELECT f.run_id, b.content FROM files f JOIN blobs b ON b.hash = f.hash "
+                                     "WHERE f.path = ? AND f.run_id < ? ORDER BY f.run_id ASC LIMIT 1",
+                                (f["path"], run_id))
+                first = first_rows[0] if first_rows else None
+                versions = _q(con, "SELECT COUNT(*) FROM files WHERE path = ? AND run_id <= ?", (f["path"], run_id))[0][0]
                 diff = None
                 if prev is not None:
                     diff = "".join(difflib.unified_diff(
                         prev["content"].splitlines(keepends=True),
                         f["content"].splitlines(keepends=True),
                         fromfile=f"run {prev['run_id']}", tofile=f"run {run_id}"))
-                run["files"].append({"path": f["path"], "content": f["content"],
-                                     "prev_run": prev["run_id"] if prev else None, "diff": diff})
+                run["files"].append({
+                    "path": f["path"], "content": f["content"], "diff": diff, "version": versions,
+                    "prev_run": prev["run_id"] if prev else None,
+                    "prev_content": prev["content"] if prev else None,
+                    # the first version, so a whole session's worth of changes can be reviewed at once
+                    "first_run": first["run_id"] if first and prev and first["run_id"] != prev["run_id"] else None,
+                    "first_content": first["content"] if first and prev and first["run_id"] != prev["run_id"] else None,
+                    "first_diff": "".join(difflib.unified_diff(
+                        first["content"].splitlines(keepends=True), f["content"].splitlines(keepends=True),
+                        fromfile=f"run {first['run_id']}", tofile=f"run {run_id}"))
+                    if first and prev and first["run_id"] != prev["run_id"] else None,
+                })
             run["notes"] = [dict(n) for n in _q(
                 con, "SELECT id, created, text FROM notes WHERE delivered_run = ? ORDER BY id", (run_id,))]
         return run

@@ -59,6 +59,21 @@ h2 .path { text-transform: none; letter-spacing: 0; font-family: var(--mono); co
 .tabs { display: flex; gap: 4px; flex-shrink: 0; margin-left: auto; }
 .tabs button { padding: 2px 8px; font-size: 11px; }
 h2 .path { overflow-wrap: anywhere; }
+.filebar { display: flex; gap: 10px; align-items: center; font-size: 12px; color: var(--muted); margin: 18px 0 -8px; flex-wrap: wrap; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; padding: 3px 10px; font-size: 12px; background: transparent; color: var(--muted); }
+.seg button.on { background: var(--accent); color: #fff; }
+.filebar label { display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
+.fhead { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin: 20px 0 6px; }
+.fhead .fname { font-family: var(--mono); font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
+.fhead .ver { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.fhead .counts { font-family: var(--mono); font-size: 12px; }
+.fhead .counts .a { color: var(--ok); } .fhead .counts .d { color: var(--bad); }
+.fhead .tabs { margin-left: auto; }
+.filemount { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; min-height: 20px; }
+.unchanged { padding: 8px 12px; font-size: 12.5px; color: var(--muted); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 6px 6px 0 0; border-bottom: 0; }
+.unchanged + .filemount { border-top-left-radius: 0; border-top-right-radius: 0; }
 pre.code { margin: 0; font-family: var(--mono); font-size: 12.5px; background: var(--panel);
   border: 1px solid var(--line); border-radius: 6px; padding: 10px; overflow: auto; max-height: 60vh; }
 pre.code span { display: block; }
@@ -310,26 +325,116 @@ function renderTrail(trail, runId) {
     ${sum ? `<div class="trail-sum" style="border:0;padding:0 0 6px">${sum}</div>` : ""}${body}`;
 }
 
+// ---- scripts: rendered with @pierre/diffs (bundled in /static/diffs.js; https://diffs.com) ----
+let Diffs = null;
+const diffsReady = import("/static/diffs.js").then((m) => (Diffs = m)).catch((e) => {
+  console.warn("valet: diff renderer unavailable, using plain diffs", e);
+});
+const pref = (k, d) => { try { return localStorage.getItem("valet." + k) ?? d; } catch { return d; } };
+const setPref = (k, v) => { try { localStorage.setItem("valet." + k, v); } catch {} };
+let diffStyle = pref("diffStyle", "split"), wrapLines = pref("wrap", "1") === "1";
+const narrow = matchMedia("(max-width: 700px)");
+const effectiveStyle = () => (narrow.matches ? "unified" : diffStyle);   // split is unreadable on a phone
+narrow.addEventListener("change", () => loadDetail(true));
+const mounted = new Map();   // key -> { host, inst }: rendered scripts survive output polling
+
+const LANG_BY_EXT = { py: "python", pyw: "python", sql: "sql", sh: "shellscript", bash: "shellscript",
+  zsh: "shellscript", json: "json", yaml: "yaml", yml: "yaml", toml: "toml", md: "markdown", r: "r" };
+function fileInput(path, contents) {
+  const name = path.split(/[\\/]/).pop();
+  const lang = LANG_BY_EXT[(name.split(".").pop() || "").toLowerCase()];
+  return lang ? { name, contents } : { name, contents, lang: "text" };   // unbundled → plain text
+}
+
+function counts(diff) {
+  let a = 0, d = 0;
+  for (const l of (diff || "").split("\n")) {
+    if (l.startsWith("+") && !l.startsWith("+++")) a++;
+    else if (l.startsWith("-") && !l.startsWith("---")) d++;
+  }
+  return { a, d };
+}
+
+function viewFor(f, key) {
+  const v = fileView[key];
+  if (v === "first" && f.first_content != null) return v;
+  if (v === "full" || f.prev_content == null) return "full";
+  return "prev";
+}
+
 function renderFile(f, runId, cwd) {
   const shown = f.path.startsWith(cwd + "/") ? f.path.slice(cwd.length + 1) : f.path;
   const key = runId + f.path;
-  const hasDiff = f.diff !== null;
-  const view = fileView[key] || (f.diff ? "diff" : "full");
-  let body;
-  if (view === "diff" && f.diff) body = `<pre class="code">${renderDiff(f.diff)}</pre>`;
-  else if (view === "diff" && f.diff === "") body = `<div class="meta">unchanged since run #${f.prev_run}</div>`;
-  else body = `<pre class="code">${esc(f.content)}</pre>`;
-  const tabs = hasDiff ? `<span class="tabs">
-      <button class="${view === "diff" ? "" : "ghost"}" data-key="${esc(key)}" data-view="diff">diff vs #${f.prev_run}</button>
-      <button class="${view === "full" ? "" : "ghost"}" data-key="${esc(key)}" data-view="full">full</button></span>` : `<span class="meta">first version</span>`;
-  return `<h2>script <span class="path" title="${esc(f.path)}">${esc(shown)}</span>${tabs}</h2>${body}`;
+  const view = viewFor(f, key);
+  const tab = (v, label) => `<button class="${view === v ? "" : "ghost"}" data-key="${esc(key)}" data-view="${v}">${label}</button>`;
+  const tabs = f.prev_content == null ? "" : `<span class="tabs">${tab("prev", `changes vs #${f.prev_run}`)}${
+    f.first_content != null ? tab("first", `vs first #${f.first_run}`) : ""}${tab("full", "full file")}</span>`;
+  const shownDiff = view === "first" ? f.first_diff : f.diff;
+  const c = counts(shownDiff);
+  const countHtml = f.prev_content == null ? `<span class="ver">first version</span>`
+    : shownDiff ? `<span class="counts" title="lines added / removed ${view === "first" ? `since run #${f.first_run}` : `since run #${f.prev_run}`}"><span class="a">+${c.a}</span> <span class="d">−${c.d}</span></span>` : "";
+  const unchanged = view === "prev" && f.diff === ""
+    ? `<div class="unchanged">unchanged since run #${f.prev_run}</div>` : "";
+  const mkey = [key, view, effectiveStyle(), wrapLines, Diffs ? "diffs" : "plain"].join("|");
+  return `<div class="fhead"><span class="fname" title="${esc(f.path)}">${esc(shown)}</span>
+      <span class="ver">v${f.version || 1}</span>${countHtml}${tabs}</div>
+    ${unchanged}<div class="filemount" data-mkey="${esc(mkey)}" data-key="${esc(key)}"></div>`;
+}
+
+function renderFileBar(files) {
+  if (!files.length) return "";
+  const b = (v, label) => `<button class="${diffStyle === v ? "on" : ""}" data-style="${v}">${label}</button>`;
+  const seg = narrow.matches ? "" : `<span class="seg">${b("split", "Split")}${b("unified", "Unified")}</span>`;
+  return `<div class="filebar">${seg}
+    <label><input type="checkbox" id="wrap" ${wrapLines ? "checked" : ""}> wrap lines</label></div>`;
+}
+
+function mountFiles(run) {
+  const used = new Set();
+  document.querySelectorAll(".filemount").forEach((slot) => {
+    const mkey = slot.dataset.mkey;
+    used.add(mkey);
+    const cached = mounted.get(mkey);
+    if (cached) { slot.replaceWith(cached.host); return; }
+    const f = run.files.find((x) => run.id + x.path === slot.dataset.key);
+    const view = viewFor(f, slot.dataset.key);
+    const old = view === "prev" ? f.prev_content : view === "first" ? f.first_content : null;
+    const host = document.createElement("div");
+    host.className = "filemount";
+    host.dataset.mkey = mkey;
+    let inst = null;
+    if (Diffs) {
+      const opts = { themeType: "system", overflow: wrapLines ? "wrap" : "scroll", diffStyle: effectiveStyle(),
+                     disableFileHeader: true, hunkSeparators: "line-info", lineDiffType: "word-alt" };
+      try {
+        if (old != null && old !== f.content) {
+          inst = new Diffs.FileDiff(opts);
+          inst.render({ oldFile: fileInput(f.path, old), newFile: fileInput(f.path, f.content), containerWrapper: host });
+        } else {
+          inst = new Diffs.File(opts);
+          inst.render({ file: fileInput(f.path, f.content), containerWrapper: host });
+        }
+      } catch (e) { console.warn("valet: diff render failed", e); inst = null; host.innerHTML = ""; }
+    }
+    if (!inst) {  // fallback: plain unified diff / file
+      host.innerHTML = view !== "full" && f.diff && view === "prev"
+        ? `<pre class="code" style="border:0">${renderDiff(f.diff)}</pre>`
+        : `<pre class="code" style="border:0">${esc(f.content)}</pre>`;
+    }
+    slot.replaceWith(host);
+    mounted.set(mkey, { host, inst });
+  });
+  for (const [k, m] of mounted) {   // free scripts no longer on screen
+    if (!used.has(k)) { try { m.inst && m.inst.cleanUp(); } catch {} mounted.delete(k); }
+  }
 }
 
 async function loadDetail(force) {
   if (selected === null) return;
   const r = await (await fetch(`/api/runs/${selected}`)).json();
   if (r.error) return;
-  const key = JSON.stringify([r.id, r.exit_code, r.output.length, (r.trail || []).length, fileView, [...openNodes]]);
+  const key = JSON.stringify([r.id, r.exit_code, r.output.length, (r.trail || []).length, fileView, [...openNodes],
+                             diffStyle, wrapLines, !!Diffs]);
   if (!force && key === lastDetailKey) return;
   lastDetailKey = key;
   const outEl = document.getElementById("out");
@@ -339,11 +444,12 @@ async function loadDetail(force) {
     <div class="meta"><span class="dot ${st}"></span>run #${r.id} · ${ago(r.started)} ·
       ${r.exit_code === null ? "running…" : "exit " + r.exit_code} ${r.duration != null ? "· " + r.duration.toFixed(1) + "s" : ""} · ${esc(r.cwd)}</div>
     <div class="cmdline">$ ${esc(r.argv.join(" "))}</div>
-    ${r.files.map((f) => renderFile(f, r.id, r.cwd)).join("")}
+    ${renderFileBar(r.files)}${r.files.map((f) => renderFile(f, r.id, r.cwd)).join("")}
     ${renderTrail(r.trail, r.id)}
     <h2>output ${r.truncated ? '<span class="meta">(truncated)</span>' : ""}</h2>
     <pre class="code" id="out">${esc(r.output) || '<span class="meta">(no output)</span>'}</pre>
     ${r.notes.map((n) => `<div class="note-delivered"><b>delivered to agent:</b> ${esc(n.text)}</div>`).join("")}`;
+  mountFiles(r);
   drawEdges();
   const o = document.getElementById("out");
   if (atBottom || r.exit_code === null) o.scrollTop = o.scrollHeight;
@@ -378,8 +484,13 @@ $("#detail").addEventListener("click", (e) => {
     openNodes.has(k) ? openNodes.delete(k) : openNodes.add(k);
     loadDetail(true); return;
   }
+  const st = e.target.closest("button[data-style]");
+  if (st) { diffStyle = st.dataset.style; setPref("diffStyle", diffStyle); loadDetail(true); return; }
   const b = e.target.closest("button[data-view]"); if (!b) return;
   fileView[b.dataset.key] = b.dataset.view; loadDetail(true);
+});
+$("#detail").addEventListener("change", (e) => {
+  if (e.target.id === "wrap") { wrapLines = e.target.checked; setPref("wrap", wrapLines ? "1" : "0"); loadDetail(true); }
 });
 $("#pending").addEventListener("click", async (e) => {
   const id = e.target.dataset.del; if (!id) return;
@@ -391,6 +502,7 @@ $("#note-form").addEventListener("submit", async (e) => {
   await fetch("/api/notes", { method: "POST", headers: { "X-Valet": "1" }, body: JSON.stringify({ text }) });
   $("#note").value = ""; tick();
 });
+diffsReady.finally(() => loadDetail(true));
 tick(); setInterval(tick, 1500);
 </script>
 </body>

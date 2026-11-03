@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "valet"
-version = "0.4.0"
+version = "0.5.0"
 description = "Make your coding agent's scratch scripts and terminal runs durable, visible and steerable"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -17,4 +17,4 @@ valet = "valet.cli:main"
 packages = ["valet"]
 
 [tool.setuptools.package-data]
-valet = ["viewer.html", "hook/sitecustomize.py"]
+valet = ["viewer.html", "hook/sitecustomize.py", "static/*"]
