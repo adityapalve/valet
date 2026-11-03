@@ -160,6 +160,10 @@ pre.code span { display: block; }
 .grid td.rn, .grid th.rn { color: var(--muted); text-align: right; cursor: default; }
 .grid td.num { text-align: right; }
 .grid tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--bg) 50%, transparent); }
+.chartbox { padding: 10px 12px; min-height: 120px; }
+.chartbox .vega-embed { width: 100%; }
+.art iframe { display: block; width: 100%; height: 480px; border: 0; background: #fff; }
+.art-head a { font-size: 12px; color: var(--accent); }
 .art img { display: block; max-width: 100%; height: auto; margin: 0 auto; background: #fff; }
 .art .err { padding: 8px 12px; color: var(--bad); font-size: 12.5px; }
 .note-delivered { border-left: 3px solid var(--run); padding: 6px 10px; background: var(--panel);
@@ -431,10 +435,28 @@ function renderFile(f, runId, cwd) {
 
 // ---- outputs: frames written or printed, files and images the run produced ----------------
 const artCache = new Map();   // key -> element (keeps sort/filter state across polls)
-const KIND = { write: "written", print: "printed", file: "file", image: "image" };
+const KIND = { write: "written", print: "printed", file: "file", image: "image", chart: "chart", html: "html" };
+let vegaLib = null;   // loaded only when a run has a chart
+const loadVega = () => (vegaLib ||= import("/static/vega.js"));
+const MULTI_VIEW = ["facet", "hconcat", "vconcat", "concat", "repeat"];
+
+function drawChart(box, a) {
+  loadVega().then(({ embed }) => {
+    const spec = JSON.parse(JSON.stringify(a.spec));
+    if (!MULTI_VIEW.some((k) => k in spec)) {   // fill the card's width
+      spec.width ??= "container"; spec.height ??= 280;
+      spec.autosize ??= { type: "fit", contains: "padding" };
+    }
+    spec.config = { background: "transparent", ...(spec.config || {}) };
+    const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+    // no "open in Vega Editor": it would send the data to an external site
+    return embed(box, spec, { theme: dark ? "dark" : undefined, renderer: "svg",
+                              actions: { export: true, source: true, compiled: false, editor: false } });
+  }).catch((e) => { box.innerHTML = `<div class="err">couldn't draw this chart: ${esc(e.message || e)}</div>`; });
+}
 const isNum = (v) => v !== "" && v !== "None" && v !== "null" && !isNaN(Number(String(v).replace(/,/g, "")));
 
-function artKey(r, a) { return [r.id, a.seq, (a.shape || []).join("x"), (a.rows || []).length, a.size].join(":"); }
+function artKey(r, a) { return [r.id, a.seq, (a.shape || []).join("x"), (a.rows || []).length, a.size, a.rows_used].join(":"); }
 
 function renderOutputs(r) {
   const arts = r.artifacts || [];
@@ -466,15 +488,28 @@ function buildArtifact(a, r) {
   el.className = "art";
   const site = a.site || {};
   const loc = site.file ? `${site.file.split(/[\\/]/).pop()}:${site.line}` : "";
-  const name = a.path ? relPath(a.path, r.cwd) : `printed at ${loc}`;
+  const name = a.title || (a.path ? relPath(a.path, r.cwd) : `printed at ${loc}`);
   const shape = a.shape ? `${a.rows_estimated ? "≈" : ""}${a.shape[0].toLocaleString()} rows × ${a.shape[1]} cols` : "";
   const size = a.size != null && !a.shape ? `<span class="art-meta">${(a.size / 1024).toFixed(a.size < 10240 ? 1 : 0)} KB</span>` : "";
+  const used = a.type === "chart" ? `<span class="art-meta">${a.aggregated
+      ? `${(a.rows_used || 0).toLocaleString()} groups from ${(a.rows_total || 0).toLocaleString()} rows` : a.rows_total > a.rows_used
+      ? `first ${a.rows_used.toLocaleString()} of ${a.rows_total.toLocaleString()} rows` : `${(a.rows_used || 0).toLocaleString()} rows`}</span>` : "";
+  const fileUrl = `/api/runs/${r.id}/artifacts/${a.seq}/file`;
   el.innerHTML = `<div class="art-head"><span class="art-kind">${KIND[a.type] || a.type}</span>
       <span class="art-name" title="${esc(a.path || "")}">${esc(name)}</span>
-      ${shape ? `<span class="art-shape">${shape}</span>` : ""}${size}
+      ${shape ? `<span class="art-shape">${shape}</span>` : ""}${size}${used}
+      ${a.type === "html" ? `<a href="${fileUrl}" target="_blank" rel="noopener">open in a new tab</a>` : ""}
       ${a.lib ? `<span class="art-meta">${esc(a.lib)}</span>` : ""}${compareHtml(a)}
-      ${a.type === "write" && loc ? `<span class="loc">${esc(loc)}</span>` : ""}</div>`;
+      ${(a.type === "write" || a.type === "chart" || a.title) && loc ? `<span class="loc">${esc(loc)}</span>` : ""}</div>`;
   if (a.error) { el.insertAdjacentHTML("beforeend", `<div class="err">couldn't preview: ${esc(a.error)}</div>`); return el; }
+  if (a.type === "chart") {
+    const box = document.createElement("div"); box.className = "chartbox";
+    el.append(box); drawChart(box, a); return el;
+  }
+  if (a.type === "html") {   // sandboxed: its scripts run in an opaque origin, away from the viewer
+    el.insertAdjacentHTML("beforeend", `<iframe sandbox="allow-scripts" loading="lazy" src="${fileUrl}" title="${esc(name)}"></iframe>`);
+    return el;
+  }
   if (a.type === "image") {
     el.insertAdjacentHTML("beforeend", `<img loading="lazy" alt="${esc(name)}" src="/api/runs/${r.id}/artifacts/${a.seq}/file">`);
     return el;

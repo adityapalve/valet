@@ -27,6 +27,9 @@ the terminal exactly as before, so the agent's own terminal tool sees it, and on
   (`print(df.head(20))`), from pandas or polars, shows up as a sortable, filterable table with
   column types and % missing, compared against the same file from the previous run. CSV/TSV files
   and images (plots) written any other way are picked up too.
+- **Charts in one line**: `import valet_view as vv; vv.chart(df, x=..., y=..., kind="bar")` draws
+  an interactive chart in the viewer, from pandas, polars or plain lists, with nothing to install.
+  HTML files a run writes are shown too, in a sandboxed frame.
 - **A live viewer**: `valet ui` serves a local page showing the run timeline, script
   diffs, outputs, the data trail, streaming output and queued notes.
 
@@ -180,6 +183,31 @@ that python process (or log out), then update.
   `.valet/`; set `VALET_TRAIL_PROFILE=0` to keep data out of it, or `VALET_MAX_ARTIFACTS` to change
   the per-run limit (default 20).
 
+### Charts
+
+![chart](docs/chart.png)
+
+Every `valet py` run can `import valet_view` (valet puts it on the import path; it's stdlib-only):
+
+```python
+import valet_view as vv
+vv.chart(df, x="vl", y="bases", kind="bar", sort="-y", title="Pairs per VL")
+vv.chart(df, x="month", y="revenue", kind="line", color="region")
+vv.chart(df, x="n_vls", kind="hist")                       # also: point, area, box, heatmap
+vv.chart(df, x="team", y="minutes", agg="median", kind="bar")
+vv.vega({...}, data=df)                                     # any Vega-Lite spec
+vv.table(df.head(20), "Most widely used parts")             # a titled table
+```
+
+- Charts are [Vega-Lite](https://vega.github.io/vega-lite/) specs, drawn in the viewer with
+  tooltips and PNG/SVG export (vega-embed is bundled in `valet/static/vega.js`, so it works offline).
+  The agent rules point the agent at this helper instead of hand-written HTML.
+- Counts, histograms and `agg=` charts are computed over **all** rows before anything is sent, so
+  they're exact at any size. Charts of raw rows (points, lines without `agg`) use the first 5,000
+  rows and say so, both in the viewer and in the `[valet] chart: ...` line the agent sees.
+- HTML files a run writes appear in a sandboxed frame: their scripts run, but in an opaque origin
+  that can't reach the viewer or its API (scripts from CDNs still load if your network allows).
+
 ### Run titles and snippets
 
 Each run gets a readable title in the viewer: `valet py --title "XCL usage check" ...`, otherwise
@@ -200,7 +228,7 @@ plain text.
 
 The renderer is bundled in the package (`valet/static/diffs.js`, ~1 MB) and served by the viewer
 itself, so it works offline and behind networks that block CDNs. It is built from pinned versions
-by `tools/build-diffs` (see below); third-party licenses are in
+by `tools/build-viewer` (see below); third-party licenses are in
 `valet/static/THIRD_PARTY_LICENSES.txt`.
 
 ## Design notes
@@ -241,10 +269,10 @@ command's output is the most reliable channel available.
 python -m pytest -q
 ```
 
-To rebuild the bundled diff renderer (only needed when upgrading `@pierre/diffs`; requires Node):
+To rebuild the bundled viewer libraries (only needed when upgrading them; requires Node):
 
 ```bash
-cd tools/build-diffs && npm ci && node build.mjs
+cd tools/build-viewer && npm ci && node build.mjs
 ```
 
 The build keeps only the grammars valet highlights and Pierre's own light/dark themes, and stubs

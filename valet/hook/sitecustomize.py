@@ -71,7 +71,7 @@ def _user_frame():
         fn = f.f_code.co_filename
         if not (
             fn.startswith("<")
-            or fn == __file__
+            or os.path.dirname(os.path.abspath(fn)) == _HERE   # this hook and valet_view
             or os.sep + "site-packages" + os.sep in fn
             or os.sep + "pandas" + os.sep in fn
             or os.sep + "numpy" + os.sep in fn
@@ -213,7 +213,7 @@ def _from_user_code(depth=2):
         fn = sys._getframe(depth).f_code.co_filename
     except ValueError:
         return False
-    return not (fn == __file__ or any(d in fn for d in _LIB_DIRS))
+    return not (os.path.dirname(os.path.abspath(fn)) == _HERE or any(d in fn for d in _LIB_DIRS))
 
 
 def _snapshot(obj, lib):
@@ -247,13 +247,15 @@ def _snapshot(obj, lib):
         _state.busy = prev
 
 
-def _artifact(kind, obj, lib, target=None):
+def _artifact(kind, obj, lib, target=None, title=None):
     """Record a frame the script wrote (kind="write") or printed (kind="print")."""
     if _artifact_count[0] >= _MAX_ARTIFACTS:
         return
     try:
         path = os.path.abspath(os.fspath(target)) if isinstance(target, (str, os.PathLike)) else None
         rec = {"kind": "artifact", "type": kind, "lib": lib, "path": path, "site": _call_site()}
+        if title:
+            rec["title"] = str(title)
         rec.update(_snapshot(obj, lib))
         _artifact_count[0] += 1
         _emit(rec)

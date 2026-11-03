@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS artifacts (
     run_id INTEGER NOT NULL REFERENCES runs(id),
     seq INTEGER NOT NULL,        -- order within the run
-    type TEXT NOT NULL,          -- write | print | file | image
+    type TEXT NOT NULL,          -- write | print | chart | file | image | html
     path TEXT,                   -- absolute path for files, NULL for printed frames
     data TEXT NOT NULL,          -- JSON: shape, columns, dtypes, nulls, rows, site, size...
     PRIMARY KEY (run_id, seq)
@@ -148,7 +148,7 @@ class Store:
                 _x(con, "UPDATE runs SET trail = ?, trail_warnings = ? WHERE id = ?",
                    (json.dumps(steps), n_warn, run_id))
         if artifacts:
-            self.set_artifacts(run_id, artifacts, replace_types=("write", "print"))
+            self.set_artifacts(run_id, artifacts, replace_types=("write", "print", "chart"))
         return steps
 
     def set_artifacts(self, run_id: int, artifacts: list[dict], replace_types=("write", "print")) -> None:
@@ -168,9 +168,9 @@ class Store:
                                      (run_id,))}
 
     def artifact_file(self, run_id: int, seq: int) -> str | None:
-        """Path of an image artifact (the only kind the viewer serves from disk)."""
+        """Path of an image or HTML artifact (the only kinds the viewer serves from disk)."""
         with self._connect() as con:
-            rows = _q(con, "SELECT path FROM artifacts WHERE run_id = ? AND seq = ? AND type = 'image'",
+            rows = _q(con, "SELECT path FROM artifacts WHERE run_id = ? AND seq = ? AND type IN ('image', 'html')",
                       (run_id, seq))
         return rows[0][0] if rows else None
 

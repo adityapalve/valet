@@ -61,6 +61,17 @@ send you instructions through it. Follow these rules for this project:
   to it, so the user can follow how the data changed.
 - If the output contains `[valet] Data warnings` (e.g. a join that multiplied
   rows), investigate and fix or explain it before moving on.
+- To show the user a chart, use valet's chart helper instead of writing HTML or
+  saving image files (nothing to install; works in any `valet py` run):
+  ```
+  import valet_view as vv
+  vv.chart(df, x="month", y="revenue", kind="line", color="region", title="Revenue by month")
+  vv.chart(df, x="minutes", kind="hist")          # also: bar, point, area, box, heatmap
+  vv.vega({...vega-lite spec...}, data=df)        # anything custom
+  vv.table(df, "Top 20 users")                    # a titled table
+  ```
+  `df` can be pandas, polars or a list of dicts. Aggregate first: charts use at
+  most 5,000 rows. Each call prints `[valet] chart: <title>` when it worked.
 - Print compact output: `df.head()`, `df.shape`, `df.describe()`, never whole
   dataframes or files. The user sees printed and written dataframes as tables
   in the viewer (up to 200 rows), so `print(df.head(20))` is plenty.
@@ -155,8 +166,20 @@ class Recorder:
 def _write_out(text: str) -> None:
     """Write text to stdout as bytes in the terminal's encoding, never raising."""
     enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-    sys.stdout.buffer.write(text.encode(enc, errors="replace"))
-    sys.stdout.flush()
+    try:
+        sys.stdout.buffer.write(text.encode(enc, errors="replace"))
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        _silence_stdout()
+
+
+def _silence_stdout() -> None:
+    """The reader went away (e.g. `| head`): send further output, and the final flush, nowhere."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except OSError:
+        pass
 
 
 def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None,
@@ -193,6 +216,7 @@ def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None,
         return 127
 
     last_flush = time.monotonic()
+    reader_gone = False
     code: int
     try:
         assert proc.stdout is not None
@@ -201,8 +225,13 @@ def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None,
             data = os.read(fd, 65536)
             if not data:
                 break
-            out.write(data)
-            out.flush()
+            if not reader_gone:
+                try:
+                    out.write(data)
+                    out.flush()
+                except (BrokenPipeError, OSError):   # e.g. `valet py x.py | head`: keep recording
+                    reader_gone = True
+                    _silence_stdout()
             chunks.append(data.decode("utf-8", errors="replace"))
             if run_id is not None and time.monotonic() - last_flush > 1.0:  # live view
                 rec.call("update_output", run_id, "".join(chunks))
@@ -233,7 +262,7 @@ def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None,
             known = {a["path"] for a in captured if a.get("path")} | {str(p.resolve()) for p in snapshot or []}
             outputs = scan_outputs(cwd, started, known)
             if outputs:
-                rec.call("set_artifacts", run_id, outputs, ("file", "image"))
+                rec.call("set_artifacts", run_id, outputs, ("file", "image", "html"))
         notes = rec.call("take_notes", run_id, default=[])
     trail.unlink(missing_ok=True)
 
@@ -244,7 +273,7 @@ def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None,
     if real:
         trailer += f" | {len(real)} dataframe steps recorded"
     written = [a for a in captured if a.get("type") == "write" and a.get("path")] + \
-              [a for a in outputs if a["type"] in ("file", "image")]
+              [a for a in outputs if a["type"] in ("file", "image", "html")]
     if written:
         def describe(a: dict) -> str:
             name = os.path.relpath(a["path"], cwd) if a["path"].startswith(cwd) else a["path"]

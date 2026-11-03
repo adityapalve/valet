@@ -471,3 +471,65 @@ def test_snippets_are_tidied_and_titled(tmp_path):
     valet(tmp_path, "py", "-c", "print(1); def (")
     assert any(p.read_text() == "print(1); def ("
                for p in (tmp_path / ".valet" / "scratch").glob("snippet-*.py"))
+
+
+# ---- charts (valet_view), HTML outputs, closed pipes ---------------------------------------
+
+def test_valet_view_charts_are_exact_and_recorded(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "import valet_view as vv\n"
+        "rows = [{'team': 'ab'[i % 2], 'n': i % 3, 'm': float(i)} for i in range(9000)]\n"
+        "vv.chart(rows, x='n', kind='hist', title='n hist')\n"
+        "vv.chart(rows, x='team', y='m', agg='sum', kind='bar')\n"
+        "vv.chart(rows, x='m', y='n', kind='point')\n"
+        "vv.vega({'mark': 'bar', 'encoding': {'x': {'field': 'a'}}}, data=[{'a': 1}], title='raw')\n"
+        "try:\n    vv.chart(rows, x='nope')\nexcept ValueError as e:\n    print('error:', e)\n")
+    r = valet(tmp_path, "py", "s.py")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "[valet] chart: n hist (aggregated from 9,000 rows)" in r.stdout
+    assert "(first 5,000 of 9,000 rows)" in r.stdout          # raw points are capped, and say so
+    assert "error: valet_view.chart: no column 'nope'" in r.stdout
+    charts = [a for a in _run_json(tmp_path, 1)["artifacts"] if a["type"] == "chart"]
+    assert [c["title"] for c in charts] == ["n hist", "sum of m by team", "n by m", "raw"]
+    hist, bars = charts[0]["spec"]["data"]["values"], charts[1]["spec"]["data"]["values"]
+    assert hist == [{"n": 0, "count": 3000}, {"n": 1, "count": 3000}, {"n": 2, "count": 3000}]
+    assert sorted((b["team"], b["m"]) for b in bars) == [("a", sum(range(0, 9000, 2))), ("b", sum(range(1, 9000, 2)))]
+    assert charts[0]["site"]["line"] == 3 and charts[0]["site"]["file"].endswith("s.py")
+
+
+def test_valet_view_outside_valet_is_a_harmless_note(tmp_path):
+    hook = ROOT / "valet" / "hook"
+    r = subprocess.run([sys.executable, "-c", "import valet_view as vv; vv.chart([{'a': 1}], x='a')"],
+                       env=dict(os.environ, PYTHONPATH=str(hook), VALET_TRAIL=""), capture_output=True, text=True)
+    assert r.returncode == 0 and "not running under `valet py`" in r.stdout
+
+
+def test_html_outputs_are_served_sandboxed(tmp_path):
+    (tmp_path / "s.py").write_text("open('report.html', 'w').write('<p>hi</p><script>1</script>')\n")
+    assert "report.html" in valet(tmp_path, "py", "s.py").stdout
+    (art,) = _run_json(tmp_path, 1)["artifacts"]
+    assert art["type"] == "html"
+    proc = subprocess.Popen([sys.executable, "-m", "valet", "ui", "--foreground", "--port", "8837", "--no-browser"],
+                            cwd=tmp_path, env=_env(tmp_path), stdout=subprocess.PIPE)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        proc.stdout.readline()
+        resp = opener.open(f"http://127.0.0.1:8837/api/runs/1/artifacts/{art['seq']}/file")
+        assert resp.headers["Content-Security-Policy"] == "sandbox allow-scripts"
+        assert b"<p>hi</p>" in resp.read()
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_closed_stdout_pipe_still_records_the_run(tmp_path):
+    (tmp_path / "s.py").write_text("for i in range(20000):\n    print('line', i)\n")
+    env = dict(os.environ, VALET_HOME=str(tmp_path / ".valet"), VALET_PYTHON=sys.executable, PYTHONPATH=str(ROOT))
+    p = subprocess.Popen([sys.executable, "-m", "valet", "py", "s.py"], cwd=tmp_path, env=env,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p.stdout.readline()
+    p.stdout.close()                       # like `| head -1`
+    _, err = p.communicate(timeout=60)
+    assert p.returncode == 0 and b"Traceback" not in err
+    run = _run_json(tmp_path, 1)
+    assert run["exit_code"] == 0 and "line 19999" in run["output"]

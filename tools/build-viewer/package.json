@@ -1,0 +1,16 @@
+{
+  "name": "valet-build-viewer",
+  "private": true,
+  "description": "Builds the viewer's bundled libraries: valet/static/diffs.js (@pierre/diffs) and valet/static/vega.js (vega-embed).",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs"
+  },
+  "dependencies": {
+    "@pierre/diffs": "1.6.1",
+    "esbuild": "0.24.2",
+    "vega": "6.4.0",
+    "vega-lite": "6.5.0",
+    "vega-embed": "7.3.0"
+  }
+}

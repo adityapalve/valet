@@ -35,8 +35,10 @@ from .store import Store
 UI_FILE = "ui.json"
 # Bundled, served from the package so the viewer works offline (no CDN; corp networks often block them).
 IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
-               ".webp": "image/webp"}  # no SVG: it can carry scripts
-STATIC = {"diffs.js": "text/javascript; charset=utf-8", "THIRD_PARTY_LICENSES.txt": "text/plain; charset=utf-8"}
+               ".webp": "image/webp",  # no SVG: it can carry scripts
+               # HTML the run wrote: shown in a sandboxed frame, so its scripts can't reach the viewer
+               ".html": "text/html; charset=utf-8", ".htm": "text/html; charset=utf-8"}
+STATIC = {"diffs.js": "text/javascript; charset=utf-8", "vega.js": "text/javascript; charset=utf-8", "THIRD_PARTY_LICENSES.txt": "text/plain; charset=utf-8"}
 DEFAULT_IDLE_MINUTES = 30.0
 _no_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # corp proxies: never for localhost
 
@@ -226,7 +228,10 @@ def serve(store: Store, port: int = 8765, open_browser: bool = True,
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
             self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Content-Security-Policy", "sandbox; default-src 'none'")
+            # images: nothing may run. HTML: scripts may run, but in an opaque origin (no access to
+            # the viewer's API or cookies), and it can't navigate the viewer.
+            self.send_header("Content-Security-Policy", "sandbox allow-scripts" if ctype.startswith("text/html")
+                             else "sandbox; default-src 'none'")
             self.end_headers()
             self.wfile.write(body)
 

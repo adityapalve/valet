@@ -22,8 +22,9 @@ SKIP_DIRS = {".git", ".hg", ".svn", ".valet", "node_modules", ".venv", "venv", "
              ".ipynb_checkpoints"}
 TABULAR = {".csv", ".tsv"}
 IMAGES = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+HTML = {".html", ".htm"}
 OTHER_DATA = {".parquet", ".xlsx", ".xls", ".json", ".jsonl", ".ndjson", ".feather", ".arrow", ".ipc",
-              ".pkl", ".pickle", ".h5", ".hdf5", ".db", ".sqlite", ".duckdb", ".html", ".pdf", ".svg"}
+              ".pkl", ".pickle", ".h5", ".hdf5", ".db", ".sqlite", ".duckdb", ".pdf", ".svg"}
 PREVIEW_ROWS, PREVIEW_COLS = 200, 60
 EXACT_COUNT_LIMIT = 50_000_000      # bytes; bigger CSVs get an estimated row count
 MAX_OUTPUTS = 20
@@ -39,7 +40,7 @@ def scan_outputs(root: str | Path, since: float, skip: set[str], budget_s: float
             break
         for name in filenames:
             ext = os.path.splitext(name)[1].lower()
-            if ext not in TABULAR and ext not in IMAGES and ext not in OTHER_DATA:
+            if ext not in TABULAR and ext not in IMAGES and ext not in HTML and ext not in OTHER_DATA:
                 continue
             path = os.path.abspath(os.path.join(dirpath, name))
             try:
@@ -48,7 +49,8 @@ def scan_outputs(root: str | Path, since: float, skip: set[str], budget_s: float
                 continue
             if st.st_mtime < since - 0.1 or path in skip or st.st_size == 0:
                 continue
-            art = {"type": "image" if ext in IMAGES else "file", "path": path, "size": st.st_size}
+            kind = "image" if ext in IMAGES else "html" if ext in HTML else "file"
+            art = {"type": kind, "path": path, "size": st.st_size}
             if ext in TABULAR:
                 try:
                     art.update(preview_csv(Path(path)))
