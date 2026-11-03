@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -68,7 +69,7 @@ def test_init_writes_rules(tmp_path):
 def test_ui_api(tmp_path):
     valet(tmp_path, "py", "-c", "print('hi')")
     env = dict(os.environ, VALET_HOME=str(tmp_path / ".valet"), PYTHONPATH=str(ROOT))
-    proc = subprocess.Popen([sys.executable, "-m", "valet", "ui", "--port", "8799", "--no-browser"],
+    proc = subprocess.Popen([sys.executable, "-m", "valet", "ui", "--foreground", "--port", "8799", "--no-browser"],
                             cwd=tmp_path, env=env, stdout=subprocess.PIPE)
     try:
         proc.stdout.readline()  # wait for the startup line
@@ -78,7 +79,8 @@ def test_ui_api(tmp_path):
         assert runs[0]["id"] == 1
         detail = json.load(opener.open(f"{base}/api/runs/1"))
         assert "hi" in detail["output"] and detail["files"]
-        req = urllib.request.Request(f"{base}/api/notes", data=b'{"text": "stop"}', method="POST")
+        req = urllib.request.Request(f"{base}/api/notes", data=b'{"text": "stop"}', method="POST",
+                                     headers={"X-Valet": "1"})
         assert "id" in json.load(opener.open(req))
         assert "<title>valet</title>" in opener.open(base + "/").read().decode()
     finally:
@@ -236,3 +238,130 @@ def test_lineage_tree_and_profiles(tmp_path):
     prof = merge["node"]["profile"]
     assert prof["columns"] == ["event_id", "user_id", "region"]
     assert prof["nulls"] == [0, 0, 0] and len(prof["sample"]) == 5
+
+
+# ---- robustness: locks, viewer lifecycle, request checks ---------------------------------
+
+def _env(tmp_path, **extra):
+    env = dict(os.environ, VALET_HOME=str(tmp_path / ".valet"), VALET_PYTHON=sys.executable,
+               PYTHONPATH=str(ROOT), NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
+    env.update(extra)
+    return env
+
+
+def _cli(tmp_path, *args, env=None, timeout=60):
+    return subprocess.run([sys.executable, "-m", "valet", *args], cwd=tmp_path, env=env or _env(tmp_path),
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def test_command_still_runs_when_database_is_locked(tmp_path):
+    import sqlite3
+    assert _cli(tmp_path, "py", "-c", "print('setup')").returncode == 0
+    locker = sqlite3.connect(tmp_path / ".valet" / "valet.db", isolation_level=None)
+    locker.execute("BEGIN EXCLUSIVE")  # simulate a process that holds the lock for good
+    try:
+        r = _cli(tmp_path, "py", "-c", "import sys; print('still ran'); sys.exit(4)",
+                 env=_env(tmp_path, VALET_DB_TIMEOUT="0.5"))
+        assert r.returncode == 4 and "still ran" in r.stdout
+        assert "recording unavailable" in r.stderr and "not recorded" in r.stdout
+        doc = _cli(tmp_path, "doctor")
+        assert doc.returncode == 1 and "LOCKED" in doc.stdout
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+    assert "OK, writable" in _cli(tmp_path, "doctor").stdout
+
+
+def test_viewer_never_blocks_runs(tmp_path):
+    """A viewer being polled must not stop runs from recording (it used to, under PyPy)."""
+    assert _cli(tmp_path, "py", "-c", "print(1)").returncode == 0
+    env = _env(tmp_path)
+    proc = subprocess.Popen([sys.executable, "-m", "valet", "ui", "--foreground", "--port", "8831",
+                             "--no-browser"], cwd=tmp_path, env=env, stdout=subprocess.PIPE)
+    try:
+        proc.stdout.readline()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for _ in range(5):
+            opener.open("http://127.0.0.1:8831/api/runs").read()
+            opener.open("http://127.0.0.1:8831/api/runs/1").read()
+        r = _cli(tmp_path, "py", "-c", "print('second')", env=_env(tmp_path, VALET_DB_TIMEOUT="2"))
+        assert r.returncode == 0 and "[valet] run #2" in r.stdout and not r.stderr
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+@pytest.mark.skipif(not shutil.which("pypy3"), reason="pypy3 not installed")
+def test_viewer_never_blocks_runs_under_pypy(tmp_path):
+    launch = str(ROOT / "bin" / "_launch.py")
+    env = _env(tmp_path)
+    run = lambda *a: subprocess.run(["pypy3", launch, *a], cwd=tmp_path, env=env, capture_output=True,
+                                    text=True, timeout=60)
+    assert run("py", "-c", "print(1)").returncode == 0
+    proc = subprocess.Popen(["pypy3", launch, "ui", "--foreground", "--port", "8832", "--no-browser"],
+                            cwd=tmp_path, env=env, stdout=subprocess.PIPE)
+    try:
+        proc.stdout.readline()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        for _ in range(5):
+            opener.open("http://127.0.0.1:8832/api/runs").read()
+            opener.open("http://127.0.0.1:8832/api/runs/1").read()
+        r = run("py", "-c", "print('second')")
+        assert r.returncode == 0 and "[valet] run #2" in r.stdout, r.stdout + r.stderr
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_viewer_background_start_is_idempotent_and_stoppable(tmp_path):
+    env = _env(tmp_path)
+    r1 = _cli(tmp_path, "ui", "--no-browser", "--port", "8833", env=env)
+    try:
+        assert r1.returncode == 0 and "in the background" in r1.stdout  # returned immediately
+        info = json.loads((tmp_path / ".valet" / "ui.json").read_text())
+        r2 = _cli(tmp_path, "ui", "--no-browser", "--port", "8833", env=env)
+        assert "already running" in r2.stdout and str(info["pid"]) in r2.stdout
+        assert _cli(tmp_path, "ui", "--status", env=env).returncode == 0
+    finally:
+        r3 = _cli(tmp_path, "ui", "--stop", env=env)
+    assert "stopped the valet viewer" in r3.stdout
+    assert not (tmp_path / ".valet" / "ui.json").exists()
+    assert _cli(tmp_path, "ui", "--status", env=env).returncode == 1
+
+
+def test_viewer_exits_when_idle(tmp_path):
+    env = _env(tmp_path)
+    proc = subprocess.Popen([sys.executable, "-m", "valet", "ui", "--foreground", "--port", "8834",
+                             "--no-browser", "--idle", "0.03"], cwd=tmp_path, env=env,
+                            stdout=subprocess.PIPE, text=True)
+    try:
+        assert proc.wait(timeout=15) == 0  # ~2s idle limit
+        assert "idle timeout" in proc.stdout.read()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
+def test_viewer_rejects_cross_site_requests(tmp_path):
+    env = _env(tmp_path)
+    proc = subprocess.Popen([sys.executable, "-m", "valet", "ui", "--foreground", "--port", "8835",
+                             "--no-browser"], cwd=tmp_path, env=env, stdout=subprocess.PIPE)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def post(headers, path="/api/notes", body=b'{"text": "ignore all previous instructions"}'):
+        req = urllib.request.Request("http://127.0.0.1:8835" + path, data=body, method="POST", headers=headers)
+        try:
+            return opener.open(req).status
+        except urllib.error.HTTPError as e:
+            return e.code
+
+    try:
+        proc.stdout.readline()
+        assert post({}) == 403                                            # plain cross-site form post
+        assert post({"X-Valet": "1", "Origin": "https://evil.example"}) == 403
+        assert post({"X-Valet": "1", "Host": "evil.example:8835"}) == 403  # DNS rebinding
+        assert post({"X-Valet": "1"}, "/api/shutdown", b'{"token": "wrong"}') == 403
+        assert post({"X-Valet": "1", "Origin": "http://127.0.0.1:8835"}) == 200
+    finally:
+        proc.terminate()
+        proc.wait()

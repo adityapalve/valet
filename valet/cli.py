@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .store import Store
+from .store import Store, find_home, read_trail_file, trail_file
 
 RULES = """\
 # Running code: use valet
@@ -60,6 +60,12 @@ send you instructions through it. Follow these rules for this project:
   dataframes or files.
 - If the output ends with a `[valet] Message from the user` block, treat it as a
   direct instruction from the user that takes priority over your current plan.
+- The viewer (`valet ui`) is for the user. Don't start or stop it unless they ask;
+  if they do, `valet ui` returns immediately (it runs in the background) and
+  `valet ui --stop` stops it.
+- Never delete or edit files inside `.valet/`. If valet prints `[valet] recording
+  unavailable`, your command still ran normally; run `valet doctor` and tell the
+  user what it reports. Don't try to kill processes or remove lock files.
 """
 
 
@@ -105,24 +111,68 @@ def python_cmd(script: Path) -> list[str]:
     return [python_exe()]
 
 
-def execute(store: Store, argv: list[str], snapshot: list[Path] | None = None) -> int:
-    """Run argv, tee output to our stdout, record everything. Returns the exit code."""
+class Recorder:
+    """Best-effort recording around a command. A database problem (e.g. another process
+    holding a lock) is reported once and recording stops for the rest of the run, but the
+    command itself always runs, its output always streams, and its exit code passes through.
+    """
+
+    def __init__(self, home: Path | None = None):
+        self.error: str | None = None
+        self.store: Store | None = None
+        timeout = float(os.environ.get("VALET_DB_TIMEOUT", "5"))
+        try:
+            self.store = Store(home, timeout=timeout)
+            self.home = self.store.home
+        except Exception as e:  # noqa: BLE001 - recording must never break the command
+            self.home = home or find_home()
+            (self.home / "scratch").mkdir(parents=True, exist_ok=True)
+            self._fail(e)
+
+    def _fail(self, e: Exception) -> None:
+        if self.error is None:
+            self.error = f"{type(e).__name__}: {e}"
+            sys.stderr.write(f"[valet] recording unavailable ({self.error}); the command runs "
+                             f"normally but is not recorded. Run `valet doctor` for details.\n")
+            sys.stderr.flush()
+
+    def call(self, method: str, *args, default=None):
+        if self.store is None or self.error:
+            return default
+        try:
+            return getattr(self.store, method)(*args)
+        except Exception as e:  # noqa: BLE001
+            self._fail(e)
+            return default
+
+
+def _write_out(text: str) -> None:
+    """Write text to stdout as bytes in the terminal's encoding, never raising."""
+    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+    sys.stdout.buffer.write(text.encode(enc, errors="replace"))
+    sys.stdout.flush()
+
+
+def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None) -> int:
+    """Run argv, tee output to our stdout, record what we can. Returns the exit code."""
     cwd = os.getcwd()
-    run_id = store.start_run(argv, cwd)
+    run_id = rec.call("start_run", argv, cwd)
 
     # Snapshot explicit files plus any argument that is an existing text file.
-    for p in snapshot or []:
-        store.snapshot(run_id, p)
-    for a in argv[1:]:
-        if not a.startswith("-") and len(a) < 4096 and os.path.isfile(a):
-            store.snapshot(run_id, Path(a))
+    if run_id is not None:
+        for p in snapshot or []:
+            rec.call("snapshot", run_id, p)
+        for a in argv[1:]:
+            if not a.startswith("-") and len(a) < 4096 and os.path.isfile(a):
+                rec.call("snapshot", run_id, Path(a))
 
-    env = dict(os.environ, PYTHONUNBUFFERED="1", VALET_RUN_ID=str(run_id))
+    trail = trail_file(rec.home, run_id if run_id is not None else f"unrecorded-{os.getpid()}")
+    env = dict(os.environ, PYTHONUNBUFFERED="1", VALET_RUN_ID=str(run_id or ""))
     if os.environ.get("VALET_TRAIL_OFF") != "1":
         # the hook dir holds a sitecustomize.py that records dataframe operations
         hook = str(Path(__file__).parent / "hook")
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [hook, os.environ.get("PYTHONPATH")]))
-        env["VALET_TRAIL"] = str(store.trail_path(run_id))
+        env["VALET_TRAIL"] = str(trail)
     chunks: list[str] = []
     out = sys.stdout.buffer
     try:
@@ -130,7 +180,8 @@ def execute(store: Store, argv: list[str], snapshot: list[Path] | None = None) -
     except OSError as e:
         msg = f"valet: cannot run {argv[0]!r}: {e}\n"
         sys.stderr.write(msg)
-        store.finish_run(run_id, 127, msg)
+        if run_id is not None:
+            rec.call("finish_run", run_id, 127, msg)
         return 127
 
     last_flush = time.monotonic()
@@ -145,9 +196,9 @@ def execute(store: Store, argv: list[str], snapshot: list[Path] | None = None) -
             out.write(data)
             out.flush()
             chunks.append(data.decode("utf-8", errors="replace"))
-            if time.monotonic() - last_flush > 1.0:  # live output for the viewer
-                store.update_output(run_id, "".join(chunks))
-                store.ingest_trail(run_id)
+            if run_id is not None and time.monotonic() - last_flush > 1.0:  # live view
+                rec.call("update_output", run_id, "".join(chunks))
+                rec.call("ingest_trail", run_id)
                 last_flush = time.monotonic()
         code = proc.wait()
     except KeyboardInterrupt:
@@ -161,11 +212,16 @@ def execute(store: Store, argv: list[str], snapshot: list[Path] | None = None) -
         code = code if code else 130
 
     output = "".join(chunks)
-    store.finish_run(run_id, code, output)
-    steps = store.ingest_trail(run_id)
-    store.trail_path(run_id).unlink(missing_ok=True)
+    steps = read_trail_file(trail)
+    notes: list[str] = []
+    if run_id is not None:
+        rec.call("finish_run", run_id, code, output)
+        rec.call("ingest_trail", run_id)
+        notes = rec.call("take_notes", run_id, default=[])
+    trail.unlink(missing_ok=True)
 
-    trailer = f"\n[valet] run #{run_id} · exit {code}"
+    trailer = f"\n[valet] run #{run_id} · exit {code}" if run_id is not None and not rec.error \
+        else f"\n[valet] exit {code} · not recorded (run `valet doctor`)"
     real = [st for st in steps if st["op"] != "source" and not st.get("minor")]
     if real:
         trailer += f" · {len(real)} dataframe steps recorded"
@@ -175,16 +231,14 @@ def execute(store: Store, argv: list[str], snapshot: list[Path] | None = None) -
     ]
     if warnings:
         trailer += "\n[valet] Data warnings (check these before continuing):\n" + "\n".join(warnings[:10])
-    notes = store.take_notes(run_id)
     if notes:
         trailer += "\n[valet] Message from the user (they are watching this run):\n"
         trailer += "".join(f"  - {n}\n" for n in notes)
-    out.write((trailer.rstrip("\n") + "\n").encode())
-    out.flush()
+    _write_out(trailer.rstrip("\n") + "\n")
     return code
 
 
-def cmd_py(store: Store, args: list[str]) -> int:
+def cmd_py(store: Recorder, args: list[str]) -> int:
     if not args:
         sys.exit("usage: valet py SCRIPT [ARGS...] | valet py -c CODE | valet py - < code")
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -206,7 +260,7 @@ def cmd_py(store: Store, args: list[str]) -> int:
     return execute(store, [*python_cmd(Path(args[0])), *args])
 
 
-def cmd_run(store: Store, args: list[str]) -> int:
+def cmd_run(store: Recorder, args: list[str]) -> int:
     if args and args[0] == "--":
         args = args[1:]
     if not args:
@@ -291,6 +345,49 @@ def format_step(st: dict) -> str:
     return line
 
 
+def cmd_doctor() -> int:
+    import platform
+
+    from . import __version__
+    from .ui import ping, read_info
+
+    print(f"valet {__version__} on {platform.python_implementation()} {platform.python_version()} ({sys.executable})")
+    home = find_home()
+    if not home.exists():
+        print(f"store:    {home} does not exist yet (run `valet init` in your project)")
+        return 0
+    print(f"store:    {home}")
+    ok = True
+    try:
+        store = Store(home, timeout=2)
+        note = "" if store.journal_mode == "wal" else " (WAL unavailable on this drive; works, with more waiting)"
+        print(f"database: journal mode {store.journal_mode}{note}")
+        if store.can_write(2):
+            print("database: OK, writable")
+        else:
+            ok = False
+            print("database: LOCKED - another process is holding the write lock")
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        print(f"database: cannot open ({type(e).__name__}: {e})")
+    info = read_info(home)
+    if ping(info, home):
+        print(f"viewer:   running on http://127.0.0.1:{info['port']}/ (pid {info['pid']})")
+    elif info:
+        print(f"viewer:   recorded as pid {info.get('pid')} but not responding (stale record)")
+    else:
+        print("viewer:   not running")
+    if not ok:
+        print("""
+What to do:
+  - If a viewer is running, stop it: valet ui --stop
+  - A viewer started by valet older than 0.4 can hold the lock until it exits, and
+    may not be stoppable that way. End that python process, or log out / restart.
+    Newer viewers never hold the lock and stop by themselves when idle.
+  - Don't delete files in .valet/ while a process has them open.""")
+    return 0 if ok else 1
+
+
 def cmd_init() -> int:
     root = Path.cwd()
     store = Store(root / ".valet")
@@ -309,10 +406,15 @@ def cmd_init() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
+    for stream in (sys.stdout, sys.stderr):  # e.g. a cp1252 pipe on Windows: never crash on output
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
     # `py` and `run` pass everything after them through untouched.
     if argv and argv[0] in ("py", "run"):
-        store = Store()
-        return (cmd_py if argv[0] == "py" else cmd_run)(store, argv[1:])
+        rec = Recorder()
+        return (cmd_py if argv[0] == "py" else cmd_run)(rec, argv[1:])
 
     p = argparse.ArgumentParser(prog="valet", description=__doc__.split("\n\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -326,13 +428,32 @@ def main(argv: list[str] | None = None) -> int:
     sh = sub.add_parser("show", help="show a run: script diffs and output")
     sh.add_argument("id", type=int, nargs="?")
     sh.add_argument("--full", action="store_true", help="full scripts instead of diffs")
-    ui = sub.add_parser("ui", help="start the live viewer")
+    ui = sub.add_parser("ui", help="start the live viewer in the background (or --stop / --status)")
     ui.add_argument("--port", type=int, default=8765)
     ui.add_argument("--no-browser", action="store_true")
+    ui.add_argument("--stop", action="store_true", help="stop the viewer for this project")
+    ui.add_argument("--status", action="store_true", help="is the viewer running?")
+    ui.add_argument("--foreground", action="store_true", help="run in this terminal (ctrl-c to stop)")
+    ui.add_argument("--idle", type=float, default=30.0,
+                    help="minutes without requests before the viewer exits by itself (0 = never)")
+    sub.add_parser("doctor", help="check the database and viewer, and explain any problem")
     a = p.parse_args(argv)
 
     if a.cmd == "init":
         return cmd_init()
+    if a.cmd == "doctor":
+        return cmd_doctor()
+    if a.cmd == "ui":
+        from . import ui as viewer
+
+        if a.stop:
+            return viewer.stop(find_home())
+        if a.status:
+            return viewer.status(find_home())
+        store = Store()
+        if a.foreground:
+            return viewer.serve(store, a.port, open_browser=not a.no_browser, idle=a.idle)
+        return viewer.start(store.home, a.port, open_browser=not a.no_browser, idle=a.idle)
     store = Store()
     if a.cmd == "note":
         return cmd_note(store, a.text)
@@ -340,10 +461,6 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_log(store, a.n)
     if a.cmd == "show":
         return cmd_show(store, a.id, a.full)
-    if a.cmd == "ui":
-        from .ui import serve
-
-        return serve(store, a.port, open_browser=not a.no_browser)
     return 1
 
 

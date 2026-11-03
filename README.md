@@ -57,7 +57,7 @@ In your project:
 
 ```bash
 valet init     # creates .valet/, adds it to .gitignore, writes .amazonq/rules/valet.md
-valet ui       # opens the viewer at http://127.0.0.1:8765
+valet ui       # starts the viewer in the background and opens http://127.0.0.1:8765
 ```
 
 The rules file tells the agent to run Python as `valet py ...` and other commands as
@@ -72,7 +72,9 @@ paste the same text (`valet/cli.py: RULES`) into their rules or `AGENTS.md`.
 | `valet run -- cmd args…` | run any command; arguments that are files get snapshotted |
 | `valet note "text"` | queue a message for the agent's next run |
 | `valet log` / `valet show [id] [--full]` | browse runs from the terminal |
-| `valet ui [--port N]` | live viewer |
+| `valet ui` | start the live viewer in the background (running it again just prints the URL) |
+| `valet ui --stop` / `--status` | stop the viewer / check whether it's running |
+| `valet doctor` | check the database and viewer, and say what to do about any problem |
 
 ### Data trail and transformation tree
 
@@ -128,6 +130,28 @@ valet itself has no dependencies. The scripts it runs get their packages from:
 4. Otherwise, **`python` / `python3` on `PATH`**, so an active venv is respected.
 
 Set `VALET_UV=0` to turn off the uv behaviour. `$VALET_HOME` overrides where the `.valet/` store lives.
+
+## Viewer lifecycle and troubleshooting
+
+- `valet ui` returns immediately: the server runs as a background process. It's safe to run
+  from an agent's terminal, and running it twice reuses the viewer that's already up.
+- The viewer **stops by itself** after 30 minutes without requests (`--idle N` to change, `0`
+  for never). An open tab keeps it alive.
+- `valet ui --stop` asks the viewer to shut itself down over HTTP, so it works even if the process
+  was started in a context you aren't allowed to kill (e.g. an agent's sandboxed terminal).
+  `valet ui --foreground` runs it attached to your terminal instead (ctrl-c stops it).
+- **Recording never blocks your command.** If the database can't be written within a few seconds
+  (`VALET_DB_TIMEOUT`, default 5), valet prints `[valet] recording unavailable`, runs the command
+  anyway with output and exit code intact, and stops recording for that run.
+- `valet doctor` reports the Python in use, the database's journal mode and whether it's writable,
+  and the viewer's state, with next steps if something's wrong.
+
+**`database is locked` with valet < 0.4:** older versions kept a database connection open and
+relied on CPython finishing a query as soon as its result was dropped. Under PyPy (and in some
+error paths) queries stayed open, so the viewer held a write lock for as long as it ran. Since
+0.4, every operation uses its own short-lived connection, reads every query to the end, and
+closes it. The test suite checks this under PyPy too. If an old viewer is still running, end
+that python process (or log out), then update.
 
 ## Design notes
 

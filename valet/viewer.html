@@ -134,6 +134,7 @@ label.follow { font-size: 12px; color: var(--muted); display: flex; gap: 4px; al
     <button>Send</button>
   </form>
   <label class="follow"><input type="checkbox" id="follow" checked> follow latest</label>
+  <span id="conn" class="badge-warn"></span>
   <div id="pending"></div>
 </header>
 <main>
@@ -360,7 +361,10 @@ async function tick() {
     $("#pending").innerHTML = pending.map((n) =>
       `<span class="chip">queued: ${esc(n.text)}<b data-del="${n.id}" title="withdraw">×</b></span>`).join("");
     await loadDetail(false);
-  } catch (e) { /* server restarting; try again next tick */ }
+    $("#conn").textContent = "";
+  } catch (e) {
+    $("#conn").textContent = "viewer stopped: run valet ui to restart";
+  }
 }
 
 $("#runs").addEventListener("click", (e) => {
@@ -379,12 +383,12 @@ $("#detail").addEventListener("click", (e) => {
 });
 $("#pending").addEventListener("click", async (e) => {
   const id = e.target.dataset.del; if (!id) return;
-  await fetch("/api/notes/delete", { method: "POST", body: JSON.stringify({ id: +id }) }); tick();
+  await fetch("/api/notes/delete", { method: "POST", headers: { "X-Valet": "1" }, body: JSON.stringify({ id: +id }) }); tick();
 });
 $("#note-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const text = $("#note").value.trim(); if (!text) return;
-  await fetch("/api/notes", { method: "POST", body: JSON.stringify({ text }) });
+  await fetch("/api/notes", { method: "POST", headers: { "X-Valet": "1" }, body: JSON.stringify({ text }) });
   $("#note").value = ""; tick();
 });
 tick(); setInterval(tick, 1500);
