@@ -166,6 +166,22 @@ pre.code span { display: block; }
 .art-head a { font-size: 12px; color: var(--accent); }
 .art img { display: block; max-width: 100%; height: auto; margin: 0 auto; background: #fff; }
 .art .err { padding: 8px 12px; color: var(--bad); font-size: 12.5px; }
+.errcard { border: 1px solid var(--bad); border-left-width: 4px; border-radius: 6px; background: var(--panel);
+  margin: 14px 0 4px; padding: 10px 14px; }
+.errcard .etype { font-family: var(--mono); font-weight: 700; color: var(--bad); }
+.errcard .emsg { font-family: var(--mono); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; margin: 4px 0; }
+.errcard .eloc { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.errcard .eloc b { font-family: var(--mono); color: var(--ink); font-weight: 600; }
+.errcard pre.ectx { margin: 6px 0 0; font-family: var(--mono); font-size: 12.5px; background: var(--bg);
+  border-radius: 4px; padding: 6px 0; overflow-x: auto; }
+.errcard pre.ectx span { display: block; padding: 0 10px; }
+.errcard pre.ectx .hit { background: var(--del-bg); color: var(--del); font-weight: 600; }
+.errcard pre.ectx .ln { color: var(--muted); display: inline-block; min-width: 3.5em; }
+.errcard .hint { font-size: 12.5px; margin-top: 8px; }
+.errcard details { margin-top: 8px; font-size: 12px; }
+.errcard details pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--bg); padding: 8px 10px; border-radius: 4px; max-height: 320px; overflow: auto; }
+.run .etag { color: var(--bad); font-size: 11px; margin-left: 6px; font-family: var(--mono); }
 .note-delivered { border-left: 3px solid var(--run); padding: 6px 10px; background: var(--panel);
   margin-top: 6px; border-radius: 0 6px 6px 0; }
 label.follow { font-size: 12px; color: var(--muted); display: flex; gap: 4px; align-items: center; }
@@ -576,6 +592,40 @@ function mountOutputs(r) {
   for (const k of artCache.keys()) if (!used.has(k)) artCache.delete(k);
 }
 
+
+// ---- errors: the traceback of a failed run, with the failing line in context -----------
+function sameFile(a, b) {
+  const n = (p) => p.replace(/\\/g, "/").replace(/^\.\//, "");
+  const A = n(a), B = n(b), win = /^[a-z]:\//i.test(A) || /^[a-z]:\//i.test(B);
+  return win ? A.toLowerCase() === B.toLowerCase() : A === B;
+}
+function renderError(r) {
+  const e = r.error;
+  if (!e) return "";
+  const [first, ...more] = (e.message || "").split("\n");
+  const fr = e.user_frame != null ? e.frames[e.user_frame] : e.frames[e.frames.length - 1];
+  let ctx = "";
+  if (fr) {
+    const snap = (r.files || []).find((f) => sameFile(f.path, fr.file) || sameFile(f.path, (r.cwd || "") + "/" + fr.file));
+    if (snap) {   // the recorded version of the script, so this matches what actually ran
+      const lines = snap.content.split("\n"), from = Math.max(1, fr.line - 3), to = Math.min(lines.length, fr.line + 2);
+      ctx = `<pre class="ectx">${lines.slice(from - 1, to).map((t, i) => {
+        const n = from + i; return `<span class="${n === fr.line ? "hit" : ""}"><span class="ln">${n}</span>${esc(t) || " "}</span>`;
+      }).join("")}</pre>`;
+    } else if (fr.code) {
+      ctx = `<pre class="ectx"><span class="hit"><span class="ln">${fr.line}</span>${esc(fr.code)}</span></pre>`;
+    }
+  }
+  const where = fr ? `in <b>${esc(relPath(fr.file, r.cwd))}:${fr.line}</b>${fr.func && fr.func !== "<module>" ? ` (${esc(fr.func)})` : ""}${
+    e.user_frame != null && e.user_frame < e.frames.length - 1 ? ` · raised inside ${esc(e.frames[e.frames.length - 1].file.split(/[\\/]/).slice(-2).join("/"))}` : ""}` : "";
+  return `<div class="errcard">
+    <div><span class="etype">${esc(e.type)}</span></div>
+    <div class="emsg">${esc(first)}${more.length ? "\n" + esc(more.slice(0, 6).join("\n")) + (more.length > 6 ? "\n…" : "") : ""}</div>
+    ${where ? `<div class="eloc">${where}</div>` : ""}${ctx}
+    ${e.hint ? `<div class="hint">💡 ${esc(e.hint)}</div>` : ""}
+    <details><summary>full traceback</summary><pre>${esc(e.traceback || "")}</pre></details></div>`;
+}
+
 function renderFileBar(files) {
   if (!files.length) return "";
   const b = (v, label) => `<button class="${diffStyle === v ? "on" : ""}" data-style="${v}">${label}</button>`;
@@ -627,7 +677,7 @@ function mountFiles(run) {
 async function loadDetail(force) {
   if (selected === null) return;
   const r = await (await fetch(`/api/runs/${selected}`)).json();
-  if (r.error) return;
+  if (!r || r.id == null) return;   // an API error ({"error": ...}); runs have an "error" field of their own
   const key = JSON.stringify([r.id, r.exit_code, r.output.length, (r.trail || []).length, fileView, [...openNodes],
                              (r.artifacts || []).map((a) => a.seq + ":" + (a.shape || []).join("x")).join(","),
                              diffStyle, wrapLines, !!Diffs]);
@@ -641,6 +691,7 @@ async function loadDetail(force) {
     <div class="meta"><span class="dot ${st}"></span>run #${r.id} · ${ago(r.started)} ·
       ${r.exit_code === null ? "running…" : "exit " + r.exit_code} ${r.duration != null ? "· " + r.duration.toFixed(1) + "s" : ""} · ${esc(r.cwd)}</div>
     <div class="cmdline">$ ${esc(r.argv.join(" "))}</div>
+    ${renderError(r)}
     ${renderFileBar(r.files)}${r.files.map((f) => renderFile(f, r.id, r.cwd)).join("")}
     ${renderOutputs(r)}
     ${renderTrail(r.trail, r.id)}
@@ -661,7 +712,8 @@ async function tick() {
     $("#runs").innerHTML = runs.map((r) => `
       <div class="run ${r.id === selected ? "sel" : ""}" data-id="${r.id}">
         <div class="top"><span><span class="dot ${status(r)}"></span>#${r.id}${r.trail_warnings ? `<span class="badge-warn">⚠ ${r.trail_warnings}</span>` : ""}${
-          r.n_artifacts ? `<span class="badge-out" title="outputs">▦ ${r.n_artifacts}</span>` : ""}</span><span>${ago(r.started)}</span></div>
+          r.n_artifacts ? `<span class="badge-out" title="outputs">▦ ${r.n_artifacts}</span>` : ""}${
+          r.error_type ? `<span class="etag">${esc(r.error_type)}</span>` : ""}</span><span>${ago(r.started)}</span></div>
         ${r.title ? `<div class="title" title="${esc(r.title)}">${esc(r.title)}</div>` : ""}
         <div class="cmd" title="${esc(r.argv.join(" "))}">${esc(shortCmd(r.argv, r.cwd))}</div>
       </div>`).join("");

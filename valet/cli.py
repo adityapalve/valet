@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .outputs import derive_title, human_size, scan_outputs, tidy_snippet
+from .outputs import derive_title, human_size, parse_error, scan_outputs, tidy_snippet
 from .store import Store, find_home, read_trail_file, trail_file
 
 RULES = """\
@@ -80,6 +80,8 @@ send you instructions through it. Follow these rules for this project:
 - The viewer (`valet ui`) is for the user. Don't start or stop it unless they ask;
   if they do, `valet ui` returns immediately (it runs in the background) and
   `valet ui --stop` stops it.
+- Tracebacks may include frames in `valet/hook/sitecustomize.py` (`wrapper`):
+  that's valet recording the call, not the cause. Look at your own frame above it.
 - Never delete or edit files inside `.valet/`. If valet prints `[valet] recording
   unavailable`, your command still ran normally; run `valet doctor` and tell the
   user what it reports. Don't try to kill processes or remove lock files.
@@ -256,6 +258,8 @@ def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None,
     outputs: list[dict] = []
     if run_id is not None:
         rec.call("finish_run", run_id, code, output)
+        if code != 0:
+            rec.call("set_error", run_id, parse_error(output))
         rec.call("ingest_trail", run_id)
         # files the run created or changed that the hook didn't already capture
         if os.environ.get("VALET_SCAN_OUTPUTS", "1") != "0":

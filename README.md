@@ -30,6 +30,9 @@ the terminal exactly as before, so the agent's own terminal tool sees it, and on
 - **Charts in one line**: `import valet_view as vv; vv.chart(df, x=..., y=..., kind="bar")` draws
   an interactive chart in the viewer, from pandas, polars or plain lists, with nothing to install.
   HTML files a run writes are shown too, in a sandboxed frame.
+- **Readable errors**: a failed run shows an error card with the exception, the line in *your*
+  script that triggered it (not the library frame where it was raised), the surrounding code from
+  the recorded version of the script, and a hint for common errors.
 - **A live viewer**: `valet ui` serves a local page showing the run timeline, script
   diffs, outputs, the data trail, streaming output and queued notes.
 
@@ -214,6 +217,17 @@ vv.table(df.head(20), "Most widely used parts")             # a titled table
   rows and say so, both in the viewer and in the `[valet] chart: ...` line the agent sees.
 - HTML files a run writes appear in a sandboxed frame: their scripts run, but in an opaque origin
   that can't reach the viewer or its API (scripts from CDNs still load if your network allows).
+
+### Errors
+
+![error card](docs/error.png)
+
+When a run exits non-zero, valet parses the last Python traceback in its output (chained
+exceptions, multi-line messages from pandas/polars, Windows paths). The viewer shows the
+exception type and message, the deepest frame in your own code (library frames and valet's
+recording wrapper are skipped), the lines around it from the script *as it was in that run*, a hint
+for common errors (missing module, missing file, missing column, ...) and the full traceback on
+demand. Failed runs are tagged with the exception type in the sidebar.
 
 ### Run titles and snippets
 

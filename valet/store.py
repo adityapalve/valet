@@ -92,6 +92,9 @@ class Store:
             if "title" not in cols:  # added in 0.6: a human-readable name for the run
                 with _tx(con):
                     _x(con, "ALTER TABLE runs ADD COLUMN title TEXT")
+            if "error" not in cols:  # added in 0.9: the parsed traceback of a failed run
+                with _tx(con):
+                    _x(con, "ALTER TABLE runs ADD COLUMN error TEXT")
 
     @contextmanager
     def _connect(self):
@@ -181,11 +184,19 @@ class Store:
                (output[-MAX_OUTPUT:], int(len(output) > MAX_OUTPUT), exit_code,
                 time.time() - started, run_id))
 
+    def set_error(self, run_id: int, error: dict | None) -> None:
+        with self._write() as con:
+            _x(con, "UPDATE runs SET error = ? WHERE id = ?", (json.dumps(error) if error else None, run_id))
+
     def list_runs(self, limit: int = 50) -> list[dict]:
+        cols = ("id, started, duration, cwd, argv, exit_code, trail_warnings, title, "
+                "(SELECT COUNT(*) FROM artifacts a WHERE a.run_id = runs.id) AS n_artifacts")
         with self._connect() as con:
-            rows = _q(con, "SELECT id, started, duration, cwd, argv, exit_code, trail_warnings, title, "
-                           "(SELECT COUNT(*) FROM artifacts a WHERE a.run_id = runs.id) AS n_artifacts "
-                           "FROM runs ORDER BY id DESC LIMIT ?", (limit,))
+            try:
+                rows = _q(con, f"SELECT {cols}, json_extract(error, '$.type') AS error_type "
+                               "FROM runs ORDER BY id DESC LIMIT ?", (limit,))
+            except sqlite3.OperationalError:  # an SQLite built without JSON functions
+                rows = _q(con, f"SELECT {cols}, NULL AS error_type FROM runs ORDER BY id DESC LIMIT ?", (limit,))
         return [dict(r, argv=json.loads(r["argv"])) for r in rows]
 
     def get_run(self, run_id: int) -> dict | None:
@@ -196,6 +207,7 @@ class Store:
             r = rows[0]
             run = dict(r, argv=json.loads(r["argv"]))
             run["trail"] = json.loads(r["trail"]) if r["trail"] else []
+            run["error"] = json.loads(r["error"]) if r["error"] else None
             run["files"] = []
             for f in _q(con, "SELECT f.path, b.content FROM files f JOIN blobs b ON b.hash = f.hash "
                              "WHERE f.run_id = ? ORDER BY f.path", (run_id,)):

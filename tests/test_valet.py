@@ -564,3 +564,53 @@ def test_polars_transformation_steps(tmp_path):
     assert gb["params"] == {"by": "[vl]", "aggs": "[n]"} and left["warnings"]
     assert "FILTER" in coll["params"]["plan"] and coll["output"] == [1, 3]
     assert steps[0]["node"]["profile"]["columns"] == ["base", "vl"]
+
+
+# ---- readable errors --------------------------------------------------------------------------
+
+def test_failed_run_records_a_readable_error(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "def load():\n"
+        "    raise ValueError('bad header\\nexpected 3 columns')\n"
+        "\n"
+        "load()\n")
+    r = valet(tmp_path, "py", "s.py")
+    assert r.returncode == 1
+    run = _run_json(tmp_path, 1)
+    e = run["error"]
+    assert e["type"] == "ValueError" and e["message"] == "bad header\nexpected 3 columns"
+    f = e["frames"][e["user_frame"]]
+    assert f["line"] == 2 and f["func"] == "load" and f["code"] == "raise ValueError('bad header\\nexpected 3 columns')"
+    assert "Traceback" in e["traceback"]
+    assert _run_json(tmp_path, 1)["error"] is not None
+    assert valet(tmp_path, "py", "-c", "print(1)").returncode == 0 and _run_json(tmp_path, 2)["error"] is None
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pandas") is None, reason="pandas not installed")
+def test_error_inside_a_library_points_at_the_users_line(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "import pandas as pd\n"
+        "df = pd.DataFrame({'a': [1]})\n"
+        "# the agent typoed the column\n"
+        "df = df.drop(columns=['b'])\n")
+    assert valet(tmp_path, "py", "s.py").returncode == 1
+    e = _run_json(tmp_path, 1)["error"]
+    assert e["type"] == "KeyError" and e["hint"]
+    user = e["frames"][e["user_frame"]]
+    assert user["file"].endswith("s.py") and user["line"] == 4      # not pandas, not valet's wrapper
+    assert any(f.get("valet") for f in e["frames"])                  # the wrapper frame is marked
+
+
+def test_parse_error_handles_chained_and_windows_tracebacks():
+    sys.path.insert(0, str(ROOT))
+    try:
+        from valet.outputs import parse_error
+    finally:
+        sys.path.remove(str(ROOT))
+    out = ('Traceback (most recent call last):\n  File "C:\\\\p\\\\a.py", line 1, in <module>\n    x = {}["k"]\n'
+           "KeyError: 'k'\n\nDuring handling of the above exception, another exception occurred:\n\n"
+           'Traceback (most recent call last):\n  File "C:\\\\p\\\\a.py", line 3, in <module>\n    raise RuntimeError("wrapped")\n'
+           "RuntimeError: wrapped\n")
+    e = parse_error(out)
+    assert e["type"] == "RuntimeError" and e["frames"][e["user_frame"]]["line"] == 3
+    assert parse_error("all good\n") is None

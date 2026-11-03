@@ -191,3 +191,72 @@ def human_size(n: int) -> str:
 
 
 __all__ = ["scan_outputs", "preview_csv", "derive_title", "tidy_snippet", "human_size"]
+
+
+# ---- errors ---------------------------------------------------------------------------------
+
+import re as _re
+
+_FRAME_RE = _re.compile(r'^  File "(?P<file>[^"]+)", line (?P<line>\d+)(?:, in (?P<func>.+))?$')
+_LIB_MARKERS = ("site-packages", "dist-packages", "<frozen", f"{os.sep}lib{os.sep}python", "\\Lib\\")
+HINTS = {
+    "ModuleNotFoundError": "The package isn't installed in the Python this ran with. For a scratch "
+                           "script, declare it in a `# /// script` dependencies header.",
+    "FileNotFoundError": "Paths are relative to the folder the run started in (shown above).",
+    "ColumnNotFoundError": "Check the column name against the frame's columns (see the outputs / data trail).",
+    "KeyError": "Often a missing column or dictionary key; check the exact name and case.",
+    "SchemaError": "The data types don't match what the operation expects; check dtypes.",
+    "MemoryError": "The data didn't fit in memory; filter or select columns earlier, or use a lazy query.",
+}
+
+
+def parse_error(output: str) -> dict | None:
+    """The last Python traceback in a run's output: type, message, frames, and the user's frame."""
+    lines = output.splitlines()
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("Traceback (most recent call last):")]
+    if not starts:
+        return None
+    i = starts[-1] + 1
+    frames = []
+    while i < len(lines):
+        m = _FRAME_RE.match(lines[i])
+        if m:
+            frames.append({"file": m["file"], "line": int(m["line"]), "func": m["func"] or "", "code": ""})
+            i += 1
+            # the source line, then optional ^^^^ markers
+            while i < len(lines) and lines[i].startswith("    "):
+                if not frames[-1]["code"] and lines[i].strip().strip("^~ "):
+                    frames[-1]["code"] = lines[i].strip()
+                i += 1
+            continue
+        if lines[i].startswith("  ") or not lines[i].strip():
+            i += 1
+            continue
+        break
+    rest = lines[i:]
+    if not rest:
+        return None
+    head = rest[0]
+    etype, _, msg = head.partition(": ") if ": " in head else (head.rstrip(":"), "", "")
+    # message continues on following lines (polars, pandas often do this) until a blank line
+    more = []
+    for ln in rest[1:]:
+        if not ln.strip() or ln.startswith("[valet]"):
+            break
+        more.append(ln)
+    message = "\n".join([msg] + more).strip()
+    short_type = etype.rsplit(".", 1)[-1].strip()
+    user = None
+    for idx in range(len(frames) - 1, -1, -1):
+        f = frames[idx]["file"]
+        # valet's own recording wrapper (valet/hook/...) is never the cause
+        if "/valet/hook/" in f.replace("\\", "/"):
+            frames[idx]["valet"] = True
+            continue
+        if not any(mk in f for mk in _LIB_MARKERS) and not f.startswith("<"):
+            user = idx
+            break
+    return {"type": short_type, "qualified_type": etype.strip(), "message": message[:2000],
+            "frames": frames[-30:], "user_frame": None if user is None else user - max(0, len(frames) - 30),
+            "hint": HINTS.get(short_type),
+            "traceback": "\n".join(lines[starts[-1]:i + 1 + len(more)])[-8000:]}
