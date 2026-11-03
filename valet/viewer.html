@@ -145,7 +145,7 @@ pre.code span { display: block; }
 .art-cmp { font-size: 12px; } .art-cmp .up { color: var(--accent); } .art-cmp .down { color: var(--bad); }
 .art-head .loc { margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
 .art-tools { display: flex; gap: 10px; align-items: center; padding: 6px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
-.art-tools input { padding: 4px 8px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg);
+.art-tools input[type=search] { padding: 4px 8px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg);
   color: var(--ink); font: inherit; font-size: 12.5px; min-width: 0; width: 220px; max-width: 100%; }
 .art-tools .meta { margin: 0; }
 .grid { max-height: 420px; overflow: auto; }
@@ -182,6 +182,13 @@ pre.code span { display: block; }
 .errcard details pre { font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere;
   background: var(--bg); padding: 8px 10px; border-radius: 4px; max-height: 320px; overflow: auto; }
 .run .etag { color: var(--bad); font-size: 11px; margin-left: 6px; font-family: var(--mono); }
+.grid th .prof { font-weight: 400; font-size: 10.5px; color: var(--muted); margin-top: 5px; min-width: 110px; }
+.grid th .prof svg { display: block; }
+.grid th .prof .topv { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 6px; align-items: center; }
+.grid th .prof .topv span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 110px; }
+.grid th .prof .bar { height: 3px; background: var(--accent); border-radius: 2px; grid-column: 1 / 3; margin-bottom: 2px; opacity: .7; }
+.art.noprof .prof { display: none; }
+.art-tools label { font-size: 12px; color: var(--muted); display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
 .note-delivered { border-left: 3px solid var(--run); padding: 6px 10px; background: var(--panel);
   margin-top: 6px; border-radius: 0 6px 6px 0; }
 label.follow { font-size: 12px; color: var(--muted); display: flex; gap: 4px; align-items: center; }
@@ -499,6 +506,29 @@ function compareHtml(a) {
   return `<span class="art-cmp">vs run #${p.run_id}: ${bits.join(" · ")}</span>`;
 }
 
+
+// ---- column profiles (computed over the whole frame by the hook) ----------------------
+const compact = (v) => typeof v === "number"
+  ? new Intl.NumberFormat(undefined, { notation: Math.abs(v) >= 1e5 ? "compact" : "standard", maximumFractionDigits: 2 }).format(v)
+  : String(v);
+let showProfiles = pref("profiles", "1") === "1";
+function profileHtml(p, n) {
+  if (!p || !Object.keys(p).length) return "";
+  if (p.hist) {
+    const max = Math.max(...p.hist.counts, 1), w = 110, h = 26, bw = w / p.hist.counts.length;
+    const bars = p.hist.counts.map((c, i) => `<rect x="${(i * bw + 0.5).toFixed(1)}" y="${(h - (c / max) * h).toFixed(1)}" width="${(bw - 1).toFixed(1)}" height="${((c / max) * h).toFixed(1)}" rx="1" fill="var(--accent)" opacity=".75"><title>${c.toLocaleString()} rows</title></rect>`).join("");
+    return `<div class="prof" title="mean ${compact(p.mean)} · median ${compact(p.median)} · ${(p.distinct || 0).toLocaleString()} distinct">
+      <svg width="${w}" height="${h}" aria-label="distribution">${bars}</svg>${compact(p.min)} – ${compact(p.max)}</div>`;
+  }
+  if (p.top) {
+    const rows = p.top.slice(0, 3).map(([v, c]) => `<span title="${esc(v)}">${esc(v)}</span><span>${compact(c)}</span>
+      <div class="bar" style="width:${Math.max(2, 100 * c / Math.max(1, n))}%"></div>`).join("");
+    return `<div class="prof"><div class="topv">${rows}</div>${(p.distinct || 0).toLocaleString()} distinct</div>`;
+  }
+  if (p.min != null) return `<div class="prof">${esc(p.min)} → ${esc(p.max)}</div>`;
+  return p.distinct != null ? `<div class="prof">${p.distinct.toLocaleString()} distinct</div>` : "";
+}
+
 function buildArtifact(a, r) {
   const el = document.createElement("div");
   el.className = "art";
@@ -545,12 +575,14 @@ function buildArtifact(a, r) {
   });
   el.insertAdjacentHTML("beforeend", `<div class="art-tools">
       <input type="search" placeholder="filter rows…" aria-label="filter rows">
+      ${a.profile ? `<label title="computed over ${a.profile_sampled ? "a 1M-row sample" : "all rows"}"><input type="checkbox" class="profchk" ${showProfiles ? "checked" : ""}> column summaries${a.profile_sampled ? " (sampled)" : ""}</label>` : ""}
       <span class="meta count">${shown}${a.more_columns ? ` · +${a.more_columns} more columns` : ""}</span></div>
     <div class="grid"><table><thead><tr><th class="rn">#</th>${a.columns.map((c, i) => {
       const nulls = a.nulls ? a.nulls[i] : null, n = a.shape ? a.shape[0] : rows.length;
       const pct = nulls != null && n ? 100 * nulls / n : 0;
       return `<th data-col="${i}" title="sort by ${esc(c)}">${esc(c)} <span class="dtype">${esc((a.dtypes || [])[i] || "")}</span>${
-        nulls == null ? "" : `<div class="nulltxt">${nulls ? pct.toFixed(1) + "% missing" : "no missing"}</div><div class="nullbar"><i style="width:${Math.min(100, pct)}%"></i></div>`}</th>`;
+        nulls == null ? "" : `<div class="nulltxt">${nulls ? pct.toFixed(1) + "% missing" : "no missing"}</div><div class="nullbar"><i style="width:${Math.min(100, pct)}%"></i></div>`}${
+        a.profile ? profileHtml(a.profile[i], n - (nulls || 0)) : ""}</th>`;
     }).join("")}</tr></thead><tbody></tbody></table></div>`);
   const tbody = el.querySelector("tbody"), count = el.querySelector(".count");
   const draw = () => {
@@ -572,7 +604,14 @@ function buildArtifact(a, r) {
     const c = +th.dataset.col;
     state.dir = state.sort === c ? -state.dir : 1; state.sort = c; draw();
   });
-  el.querySelector("input").addEventListener("input", (e) => { state.q = e.target.value; draw(); });
+  el.querySelector("input[type=search]").addEventListener("input", (e) => { state.q = e.target.value; draw(); });
+  el.classList.toggle("noprof", !showProfiles);
+  const chk = el.querySelector(".profchk");
+  if (chk) chk.addEventListener("change", (e) => {   // applies to every table, remembered per browser
+    showProfiles = e.target.checked; setPref("profiles", showProfiles ? "1" : "0");
+    document.querySelectorAll(".art").forEach((x) => x.classList.toggle("noprof", !showProfiles));
+    document.querySelectorAll(".profchk").forEach((x) => { x.checked = showProfiles; });
+  });
   draw();
   return el;
 }

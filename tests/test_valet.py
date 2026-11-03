@@ -614,3 +614,32 @@ def test_parse_error_handles_chained_and_windows_tracebacks():
     e = parse_error(out)
     assert e["type"] == "RuntimeError" and e["frames"][e["user_frame"]]["line"] == 3
     assert parse_error("all good\n") is None
+
+
+# ---- column profiles ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(importlib.util.find_spec("polars") is None or importlib.util.find_spec("pandas") is None,
+                    reason="polars and pandas needed")
+def test_outputs_carry_full_frame_column_profiles(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "import polars as pl, pandas as pd\n"   # polars first: it probes for pandas without importing it
+        "df = pl.DataFrame({'x': list(range(1000)), 'cat': ['a'] * 700 + ['b'] * 200 + [None] * 100})\n"
+        "print(df.head(3))\n"
+        "print(pd.DataFrame({'team': ['a', 'a', 'b'], 'm': [1, 2, 30]}).groupby('team').sum())\n")
+    assert valet(tmp_path, "py", "s.py").returncode == 0
+    pl_art, pd_art = _run_json(tmp_path, 1)["artifacts"]
+    # profile of the printed head(3) is of those 3 rows: what was printed is what's described
+    assert pl_art["profile"][0]["max"] == 2.0
+    assert pd_art["lib"] == "pandas" and pd_art["columns"] == ["team", "m"]
+    team, m = pd_art["profile"]                       # the index column is profiled too, aligned
+    assert team["top"] == [["a", 1], ["b", 1]] and m["min"] == 3.0 and m["max"] == 30.0 and m["hist"]["counts"][0] == 1
+
+    (tmp_path / "t.py").write_text(
+        "import polars as pl\n"
+        "df = pl.DataFrame({'x': list(range(1000)), 'cat': ['a'] * 700 + ['b'] * 200 + [None] * 100})\n"
+        "df.write_csv('out.csv')\n")
+    assert valet(tmp_path, "py", "t.py").returncode == 0
+    (art,) = _run_json(tmp_path, 2)["artifacts"]
+    x, cat = art["profile"]
+    assert x["min"] == 0 and x["max"] == 999 and x["mean"] == 499.5 and sum(x["hist"]["counts"]) == 1000
+    assert cat["top"] == [["a", 700], ["b", 200]] and cat["distinct"] == 3 and art["profile_sampled"] is False

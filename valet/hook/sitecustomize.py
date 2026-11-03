@@ -259,8 +259,92 @@ def _is_frame(v):
     return _shape(v) is not None and _lib(v) in ("pandas", "polars")
 
 
-def _snapshot(obj, lib, nrows=_PREVIEW_ROWS):
-    """Shape, columns, dtypes, null counts and the first rows of a pandas or polars frame."""
+_PROFILE_ROWS = 1_000_000   # profiles of bigger frames use a seeded sample of this many rows
+_HIST_BINS = 12
+
+
+def _num(v):
+    try:
+        f = float(v)
+        return None if f != f or f in (float("inf"), float("-inf")) else round(f, 6)
+    except (TypeError, ValueError):
+        return None
+
+
+def _hist(lo, hi, counts):
+    return {"lo": lo, "hi": hi, "counts": [int(c) for c in counts]}
+
+
+def _profile_polars(df):
+    import polars as pl
+    sampled = df.height > _PROFILE_ROWS
+    sub = df.sample(_PROFILE_ROWS, seed=0) if sampled else df
+    out = []
+    for c, dt in zip(sub.columns, sub.dtypes):
+        p = {}
+        try:
+            s = sub.get_column(c)
+            p["distinct"] = int(s.n_unique())
+            if dt.is_numeric():
+                nn = s.drop_nulls()
+                if dt.is_float():
+                    nn = nn.filter(nn.is_finite())
+                if nn.len():
+                    lo, hi = _num(nn.min()), _num(nn.max())
+                    p.update(min=lo, max=hi, mean=_num(nn.mean()), median=_num(nn.median()))
+                    if lo is not None and hi is not None and hi > lo:
+                        b = ((nn.cast(pl.Float64) - lo) / (hi - lo) * _HIST_BINS).floor().clip(0, _HIST_BINS - 1).cast(pl.Int32)
+                        counts = [0] * _HIST_BINS
+                        for k, n in b.value_counts(name="__n").iter_rows():
+                            counts[k] = n
+                        p["hist"] = _hist(lo, hi, counts)
+            elif dt.is_temporal():
+                p.update(min=str(s.min()), max=str(s.max()))
+            else:
+                vc = s.drop_nulls().cast(pl.Utf8).value_counts(sort=True, name="__n").head(5)
+                p["top"] = [[_cell(str(v)), int(n)] for v, n in vc.iter_rows()]
+        except Exception:
+            pass
+        out.append(p)
+    return out, sampled
+
+
+def _profile_pandas(df):
+    from pandas.api import types as pt
+    sampled = len(df) > _PROFILE_ROWS
+    sub = df.sample(_PROFILE_ROWS, random_state=0) if sampled else df
+    out = []
+    for i in range(sub.shape[1]):
+        p = {}
+        try:
+            s = sub.iloc[:, i]
+            p["distinct"] = int(s.nunique())
+            if pt.is_numeric_dtype(s) and not pt.is_bool_dtype(s):
+                nn = s.dropna()
+                nn = nn[(nn != float("inf")) & (nn != float("-inf"))]
+                if len(nn):
+                    lo, hi = _num(nn.min()), _num(nn.max())
+                    p.update(min=lo, max=hi, mean=_num(nn.mean()), median=_num(nn.median()))
+                    if lo is not None and hi is not None and hi > lo:
+                        b = (((nn.astype(float) - lo) / (hi - lo)) * _HIST_BINS).astype(int).clip(0, _HIST_BINS - 1)
+                        counts = [0] * _HIST_BINS
+                        for k, n in b.value_counts().items():
+                            counts[int(k)] = int(n)
+                        p["hist"] = _hist(lo, hi, counts)
+            elif pt.is_datetime64_any_dtype(s):
+                p.update(min=str(s.min()), max=str(s.max()))
+            else:
+                vc = s.dropna().astype(str).value_counts().head(5)
+                p["top"] = [[_cell(str(v)), int(n)] for v, n in vc.items()]
+        except Exception:
+            pass
+        out.append(p)
+    return out, sampled
+
+
+def _snapshot(obj, lib, nrows=_PREVIEW_ROWS, profile=False):
+    """Shape, columns, dtypes, null counts and the first rows of a pandas or polars frame;
+    with profile=True also per-column stats over the whole frame (Data Wrangler style)."""
     prev = getattr(_state, "busy", False)
     _state.busy = True
     try:
@@ -272,11 +356,14 @@ def _snapshot(obj, lib, nrows=_PREVIEW_ROWS):
             if obj.height * len(cols) <= _NULL_CELL_LIMIT:
                 snap["nulls"] = [int(x) for x in sub.null_count().row(0)]
             snap["rows"] = [[_cell(v) for v in r] for r in sub.head(nrows).rows()]
+            if profile and _PROFILE:
+                snap["profile"], snap["profile_sampled"] = _profile_polars(sub)
         else:
             df = obj.to_frame() if getattr(obj, "ndim", 2) == 1 else obj
             shape = list(df.shape)
             # a meaningful index (e.g. after groupby) is data the reader wants to see
-            if type(df.index).__name__ != "RangeIndex" or df.index.name is not None:
+            reset = type(df.index).__name__ != "RangeIndex" or df.index.name is not None
+            if reset:
                 df = df.head(_PREVIEW_ROWS).reset_index()
             sub = df.iloc[:, :_PREVIEW_COLS]
             snap = {"shape": shape, "columns": [str(c) for c in sub.columns],
@@ -284,6 +371,11 @@ def _snapshot(obj, lib, nrows=_PREVIEW_ROWS):
             if shape[0] * sub.shape[1] <= _NULL_CELL_LIMIT and len(df) == shape[0]:
                 snap["nulls"] = [int(x) for x in sub.isna().sum().tolist()]
             snap["rows"] = [[_cell(v) for v in r] for r in sub.head(_PREVIEW_ROWS).itertuples(index=False, name=None)]
+            if profile and _PROFILE:
+                full = obj.to_frame() if getattr(obj, "ndim", 2) == 1 else obj
+                if reset:  # the preview shows the index as columns: profile it too
+                    full = (full if len(full) <= _PROFILE_ROWS else full.sample(_PROFILE_ROWS, random_state=0)).reset_index()
+                snap["profile"], snap["profile_sampled"] = _profile_pandas(full.iloc[:, :_PREVIEW_COLS])
         snap["more_columns"] = max(0, snap["shape"][1] - len(snap["columns"]))
         return snap
     finally:
@@ -299,7 +391,7 @@ def _artifact(kind, obj, lib, target=None, title=None):
         rec = {"kind": "artifact", "type": kind, "lib": lib, "path": path, "site": _call_site()}
         if title:
             rec["title"] = str(title)
-        rec.update(_snapshot(obj, lib))
+        rec.update(_snapshot(obj, lib, profile=True))
         _artifact_count[0] += 1
         _emit(rec)
     except Exception:
@@ -886,15 +978,17 @@ class _LibFinder:
             spec = importlib.util.find_spec(name)
         finally:
             self.resolving = False
-        self.pending.discard(name)
-        if not self.pending and self in sys.meta_path:
-            sys.meta_path.remove(self)
+        # Don't cross the library off yet: other libraries probe with find_spec("pandas")
+        # without importing it (polars does). Only the actual import executes the module.
         if spec is None or spec.loader is None:
             return spec
         exec_module = spec.loader.exec_module
 
         def patched_exec(module):
             exec_module(module)
+            self.pending.discard(name)
+            if not self.pending and self in sys.meta_path:
+                sys.meta_path.remove(self)
             try:
                 _PATCHERS[name](module)
             except Exception:

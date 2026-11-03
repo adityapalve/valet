@@ -25,7 +25,8 @@ the terminal exactly as before, so the agent's own terminal tool sees it, and on
   flagged, to you *and* to the agent.
 - **Outputs as tables**: every DataFrame a run writes (`write_csv`, `to_parquet`, ...) or prints
   (`print(df.head(20))`), from pandas or polars, shows up as a sortable, filterable table with
-  column types and % missing, compared against the same file from the previous run. CSV/TSV files
+  column types, % missing and a summary of every column computed over the whole frame
+  (histogram and range, or top values), compared against the same file from the previous run. CSV/TSV files
   and images (plots) written any other way are picked up too.
 - **Charts in one line**: `import valet_view as vv; vv.chart(df, x=..., y=..., kind="bar")` draws
   an interactive chart in the viewer, from pandas, polars or plain lists, with nothing to install.
@@ -175,7 +176,7 @@ that python process (or log out), then update.
 
 ### Outputs
 
-![output table](docs/outputs.png)
+![output table with column summaries](docs/profiles.png)
 
 - **Captured from the frame in memory.** When a pandas or polars DataFrame is written or printed
   from your code, the hook records its shape, column dtypes, null counts and first 200 rows, so it
@@ -185,6 +186,11 @@ that python process (or log out), then update.
   run's folder that changed during the run (skipping `.git`, `.valet`, virtualenvs and other
   hidden folders; at most 1.5s and 20 files). CSV/TSV files get a table preview with a row count;
   images (PNG, JPEG, GIF, WebP) are displayed. Turn it off with `VALET_SCAN_OUTPUTS=0`.
+- **Column summaries.** For frames written or printed through pandas/polars, every column (up to
+  60) is profiled over the *whole* frame, not just the preview: numbers get a 12-bin histogram,
+  min/max, mean and median; text gets its top values and distinct count; dates get their range.
+  Frames over 1M rows are profiled on a seeded 1M-row sample (marked "sampled"). The "column
+  summaries" checkbox hides them. (CSV files found on disk get a preview but no profile.)
 - **Compared to last time.** An output is compared with the same path in the previous run that
   produced it: rows added or removed, columns added or removed.
 - **Told to the agent.** The run summary lists the outputs, e.g.
