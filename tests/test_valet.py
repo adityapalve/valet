@@ -533,3 +533,34 @@ def test_closed_stdout_pipe_still_records_the_run(tmp_path):
     assert p.returncode == 0 and b"Traceback" not in err
     run = _run_json(tmp_path, 1)
     assert run["exit_code"] == 0 and "line 19999" in run["output"]
+
+
+@pytest.mark.skipif(importlib.util.find_spec("polars") is None, reason="polars not installed")
+def test_polars_transformation_steps(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "import polars as pl\n"
+        "df = pl.DataFrame({'base': ['W5a', 'b1', 'b2', 'b2'], 'vl': ['x', 'x', 'y', 'y']})\n"
+        "# drop fixing parts\n"
+        "fixing = df.filter(pl.col('base').str.starts_with('W5'))\n"
+        "df = df.join(fixing, on=['base', 'vl'], how='anti')\n"
+        "# one row per base\n"
+        "out = (df.unique()\n"
+        "         .with_columns(pl.lit(1).alias('used')))\n"
+        "owners = pl.DataFrame({'vl': ['x', 'x'], 'who': ['a', 'b']})\n"
+        "per_vl = out.group_by('vl').agg(pl.len().alias('n')).join(owners, on='vl', how='left')\n"
+        "lazy = out.lazy().filter(pl.col('vl') == 'y').collect()\n")
+    r = valet(tmp_path, "py", "s.py")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "join fan-out" in r.stdout and "(s.py:10)" in r.stdout
+    steps = [s for s in _run_json(tmp_path, 1)["trail"] if s["op"] != "source"]
+    ops = [s["op"] for s in steps]
+    assert ops == ["filter", "join", "unique", "with_columns", "group_by.agg", "join", "collect"], ops
+    flt, anti, uniq, withc, gb, left, coll = steps
+    assert 'starts_with' in flt["params"]["predicates"] and flt["output"] == [1, 2]
+    assert anti["params"] == {"on": "[base, vl]", "how": "anti"} and anti["output"] == [3, 2]
+    assert anti["in_nodes"][1] == flt["out_node"]                 # lineage: the filtered frame fed the join
+    assert uniq["output"] == [2, 2] and withc["cols_added"] == ["used"]
+    assert uniq["site"]["comment"] == withc["site"]["comment"] == "one row per base"   # chained statement
+    assert gb["params"] == {"by": "[vl]", "aggs": "[n]"} and left["warnings"]
+    assert "FILTER" in coll["params"]["plan"] and coll["output"] == [1, 3]
+    assert steps[0]["node"]["profile"]["columns"] == ["base", "vl"]

@@ -16,8 +16,10 @@ This file must stay stdlib-only and self-contained: it also runs inside environm
 into user code.
 """
 
+import ast
 import functools
 import importlib.util
+import inspect
 import json
 import linecache
 import os
@@ -37,7 +39,8 @@ _registry = {}                 # id(frame) -> (weakref, node id)
 _labels = {}                   # node id -> variable name
 _counter = [0]
 # ops that matter for lineage but are not transformations worth a line of their own
-_MINOR = {"reset_index", "set_index", "sort_values", "sort_index", "copy", "astype",
+_MINOR = {"sort", "cast", "with_row_index", "rechunk",           # polars
+          "reset_index", "set_index", "sort_values", "sort_index", "copy", "astype",
           "rename_axis", "convert_dtypes", "reindex"}
 
 
@@ -81,6 +84,30 @@ def _user_frame():
     return f
 
 
+_STMT_STARTS = {}
+_COMPOUND = tuple(getattr(ast, n) for n in ("If", "For", "AsyncFor", "While", "With", "AsyncWith", "Try",
+                                             "TryStar", "FunctionDef", "AsyncFunctionDef", "ClassDef", "Match")
+                  if hasattr(ast, n))
+
+
+def _stmt_start(fn, ln):
+    """First line of the simple statement containing line `ln` (parsed once per file)."""
+    starts = _STMT_STARTS.get(fn)
+    if starts is None:
+        starts = {}
+        try:
+            src = "".join(linecache.getlines(fn))
+            if len(src) < 2_000_000:
+                for node in ast.walk(ast.parse(src)):
+                    if isinstance(node, ast.stmt) and not isinstance(node, _COMPOUND):
+                        for line in range(node.lineno, (node.end_lineno or node.lineno) + 1):
+                            starts[line] = node.lineno
+        except (SyntaxError, ValueError, RecursionError):
+            pass
+        _STMT_STARTS[fn] = starts
+    return starts.get(ln, ln)
+
+
 def _call_site(f=None):
     """(file, line, code, comment) of the user code that made the current call."""
     f = f or _user_frame()
@@ -89,7 +116,8 @@ def _call_site(f=None):
     fn, ln = f.f_code.co_filename, f.f_lineno
     code = linecache.getline(fn, ln).strip()
     comment = []
-    i = ln - 1
+    # comments sit above the *statement*, which may start lines earlier (chained calls in parens)
+    i = _stmt_start(fn, ln) - 1
     while i > 0 and len(comment) < 3:
         prev = linecache.getline(fn, i).strip()
         if not prev.startswith("#") or prev.startswith("# ///"):
@@ -146,6 +174,13 @@ def _profile(obj):
     """Small Data Wrangler-style summary: dtypes, null counts, first rows (≤40 columns)."""
     if not _PROFILE:
         return None
+    if _lib(obj) == "polars":
+        try:
+            snap = _snapshot(obj, "polars", nrows=5)
+            return {"columns": snap["columns"], "dtypes": snap["dtypes"], "more_columns": snap["more_columns"],
+                    "nulls": snap.get("nulls"), "sample": snap["rows"]}
+        except Exception:
+            return None
     prev = getattr(_state, "busy", False)
     _state.busy = True
     try:
@@ -216,7 +251,15 @@ def _from_user_code(depth=2):
     return not (os.path.dirname(os.path.abspath(fn)) == _HERE or any(d in fn for d in _LIB_DIRS))
 
 
-def _snapshot(obj, lib):
+def _lib(obj):
+    return type(obj).__module__.split(".")[0]
+
+
+def _is_frame(v):
+    return _shape(v) is not None and _lib(v) in ("pandas", "polars")
+
+
+def _snapshot(obj, lib, nrows=_PREVIEW_ROWS):
     """Shape, columns, dtypes, null counts and the first rows of a pandas or polars frame."""
     prev = getattr(_state, "busy", False)
     _state.busy = True
@@ -228,7 +271,7 @@ def _snapshot(obj, lib):
                     "dtypes": [str(t) for t in sub.dtypes]}
             if obj.height * len(cols) <= _NULL_CELL_LIMIT:
                 snap["nulls"] = [int(x) for x in sub.null_count().row(0)]
-            snap["rows"] = [[_cell(v) for v in r] for r in sub.head(_PREVIEW_ROWS).rows()]
+            snap["rows"] = [[_cell(v) for v in r] for r in sub.head(nrows).rows()]
         else:
             df = obj.to_frame() if getattr(obj, "ndim", 2) == 1 else obj
             shape = list(df.shape)
@@ -292,8 +335,12 @@ def _wrap_polars_write(DF, name):
 
     @functools.wraps(orig)
     def wrapper(self, *args, **kwargs):
-        if getattr(_state, "busy", False):
+        if getattr(_state, "busy", False) or not _from_user_code(2):
             return orig(self, *args, **kwargs)
+        try:
+            in_node = _node_in(self)
+        except Exception:
+            in_node = None
         _state.busy = True
         try:
             result = orig(self, *args, **kwargs)
@@ -301,10 +348,135 @@ def _wrap_polars_write(DF, name):
             _state.busy = False
         target = args[0] if args else kwargs.get("file", kwargs.get("path", kwargs.get("workbook")))
         _artifact("write", self, "polars", target)
+        try:
+            tgt = os.path.basename(os.fspath(target)) if isinstance(target, (str, os.PathLike)) else name
+            nid = _new_id()
+            _emit({"op": f"write:{name[len('write_'):]}", "params": {"target": _short(target, 200)}, "inputs": [],
+                   "in_nodes": [in_node] if in_node else [], "output": _shape(self), "site": _call_site(),
+                   "out_node": nid, "node": {"id": nid, "label": tgt, "sink": True}, "warnings": []})
+        except Exception:
+            pass
         return result
 
     wrapper._valet = True
     setattr(DF, name, wrapper)
+
+
+def _pl_str(v):
+    if _lib(v) == "polars":          # expressions / selectors read well as text
+        s = str(v)
+    elif isinstance(v, (list, tuple)):
+        s = "[" + ", ".join(_pl_str(x) for x in v[:12]) + (", ..." if len(v) > 12 else "") + "]"
+    elif isinstance(v, dict):
+        s = "{" + ", ".join(f"{k}: {_pl_str(x)}" for k, x in list(v.items())[:12]) + "}"
+    elif isinstance(v, str):
+        s = v
+    else:
+        s = _short(v)
+    return s if len(s) <= 160 else s[:159] + "..."
+
+
+def _pl_params(sig, args, kwargs, op):
+    """Parameters of a polars call by name (from its real signature), expressions as text."""
+    if sig is None:
+        return {}
+    try:
+        bound = sig.bind_partial(*args, **kwargs).arguments
+    except TypeError:
+        return {}
+    out = {}
+    for k, v in bound.items():
+        if k in ("self", "other", "items") or _is_frame(v) or v is None or (isinstance(v, (tuple, list, dict)) and not v):
+            continue
+        if isinstance(v, dict) and k in ("named_exprs", "named_aggs", "named_by"):
+            out[k.replace("named_", "")] = _pl_str(list(v))
+            continue
+        out[k] = _pl_str(v)
+    if op in ("join", "join_asof"):
+        out.setdefault("how", "inner")
+    return out
+
+
+def _out_names(exprs):
+    names = []
+    for e in exprs:
+        for x in (e if isinstance(e, (list, tuple)) else [e]):
+            try:
+                names.append(x.meta.output_name())
+            except Exception:
+                names.append(str(x)[:40])
+    return names
+
+
+def _wrap_pl_groupby(G, name):
+    orig = getattr(G, name, None)
+    if orig is None or getattr(orig, "_valet", False):
+        return
+
+    @functools.wraps(orig)
+    def wrapper(self, *args, **kwargs):
+        if getattr(_state, "busy", False) or not _from_user_code(2):
+            return orig(self, *args, **kwargs)
+        try:
+            obj = getattr(self, "df", None)
+            in_node = _node_in(obj) if obj is not None else None
+        except Exception:
+            obj, in_node = None, None
+        _state.busy = True
+        try:
+            result = orig(self, *args, **kwargs)
+        finally:
+            _state.busy = False
+        try:
+            by = list(getattr(self, "by", ()) or ()) + list((getattr(self, "named_by", None) or {}).keys())
+            extra = {"by": _pl_str(by)}
+            aggs = _out_names(args) + list(kwargs)
+            if aggs:
+                extra["aggs"] = _pl_str(aggs)
+            before = [{"shape": _shape(obj), "cols": _cols(obj), "node": in_node}]
+            _record(f"group_by.{name}", (), {}, before, result, extra=extra, params={})
+        except Exception:
+            pass
+        return result
+
+    wrapper._valet = True
+    setattr(G, name, wrapper)
+
+
+def _wrap_pl_collect(LF):
+    """LazyFrame.collect(): the result is a new frame; the (unoptimized) plan says how."""
+    orig = getattr(LF, "collect", None)
+    if orig is None or getattr(orig, "_valet", False):
+        return
+
+    @functools.wraps(orig)
+    def wrapper(self, *args, **kwargs):
+        if getattr(_state, "busy", False) or not _from_user_code(2):
+            return orig(self, *args, **kwargs)
+        _state.busy = True
+        try:
+            result = orig(self, *args, **kwargs)
+            try:
+                plan = self.explain(optimized=False)
+            except Exception:
+                plan = ""
+        finally:
+            _state.busy = False
+        if _is_frame(result):
+            try:
+                _record("collect", (), {}, [], result, params={"plan": _short_plan(plan)})
+            except Exception:
+                pass
+        return result
+
+    wrapper._valet = True
+    setattr(LF, "collect", wrapper)
+
+
+def _short_plan(plan):
+    lines = [ln.strip() for ln in plan.splitlines() if ln.strip()]
+    s = " <- ".join(lines[:8])
+    return s if len(s) <= 300 else s[:299] + "..."
 
 
 def _patch_polars(pl):
@@ -314,15 +486,32 @@ def _patch_polars(pl):
         _wrap_polars_write(DF, name)
     _wrap_print(DF, "__str__", "polars")
     _wrap_print(DF, "__repr__", "polars")
+    # transformations (and a few "minor" ones that keep the lineage tree connected)
+    for name in ("filter", "join", "join_asof", "with_columns", "select", "drop", "unique", "pivot",
+                 "unpivot", "explode", "drop_nulls", "fill_null", "fill_nan", "rename", "vstack", "hstack",
+                 "sort", "cast", "with_row_index"):
+        _wrap(DF, name, params_fn=_pl_params)
+    _wrap(pl, "concat", params_fn=_pl_params)
+    for name in ("read_csv", "read_parquet", "read_excel", "read_json", "read_ndjson", "read_ipc",
+                 "read_database", "read_avro", "read_delta"):
+        _wrap_io(pl, name, "read")
+    try:
+        from polars.dataframe.group_by import GroupBy
+        for name in ("agg", "len", "count", "sum", "mean", "median", "min", "max", "first", "last",
+                     "n_unique", "all"):
+            _wrap_pl_groupby(GroupBy, name)
+    except ImportError:
+        pass
+    _wrap_pl_collect(pl.LazyFrame)
 
 
 def _frames_in(args, kwargs):
     """DataFrame/Series inputs among the call arguments (including lists, for concat)."""
     out = []
     for v in list(args) + list(kwargs.values()):
-        if _shape(v) is not None and hasattr(v, "ndim"):
+        if _is_frame(v):
             out.append(v)
-        elif isinstance(v, (list, tuple)) and v and all(_shape(x) is not None for x in v[:50]):
+        elif isinstance(v, (list, tuple)) and v and all(_is_frame(x) for x in v[:50]):
             out.extend(v[:50])
     return out
 
@@ -396,12 +585,12 @@ def _warnings(op, params, inputs, out_shape):
     return w
 
 
-def _record(op, args, kwargs, before, result, extra=None, inplace=False):
+def _record(op, args, kwargs, before, result, extra=None, inplace=False, params=None):
     site = _call_site()
     out_shape = _shape(result)
     if out_shape is None and before:  # inplace=True: the first input was mutated
         result, out_shape = None, before[0].get("after_shape")
-    params = _params(op, args, kwargs)
+    params = dict(params) if params is not None else _params(op, args, kwargs)
     if extra:
         params.update(extra)
     rec = {
@@ -421,7 +610,7 @@ def _record(op, args, kwargs, before, result, extra=None, inplace=False):
         rec["out_node"] = nid
         rec["node"] = {"id": nid, "label": label, "profile": _profile(result)}
     out_cols = _cols(result) if result is not None else None
-    if op.startswith("groupby."):
+    if op.startswith(("groupby.", "group_by.")):
         # keys move into the index, so added/removed columns would be misleading
         rec["cols_out"] = out_cols[:50] if out_cols is not None else None
     elif out_cols is not None and before and before[0]["cols"] is not None:
@@ -432,19 +621,27 @@ def _record(op, args, kwargs, before, result, extra=None, inplace=False):
     _emit(rec)
 
 
-def _wrap(owner, name, op=None, inputs=None):
+_MULTI_INPUT = ("merge", "join", "join_asof", "concat", "vstack", "hstack")
+
+
+def _wrap(owner, name, op=None, inputs=None, params_fn=None):
     orig = getattr(owner, name, None)
     if orig is None or getattr(orig, "_valet", False):
         return
     op = op or name
+    try:
+        sig = inspect.signature(orig) if params_fn else None
+    except (TypeError, ValueError):
+        sig = None
 
     @functools.wraps(orig)
     def wrapper(*args, **kwargs):
-        if getattr(_state, "busy", False) or _PANDAS_DIR in sys._getframe(1).f_code.co_filename:
+        # only calls made by the user's code; pandas/polars call their own methods internally
+        if getattr(_state, "busy", False) or not _from_user_code(2):
             return orig(*args, **kwargs)
         try:
             frames = inputs(args, kwargs) if inputs else _frames_in(args, kwargs)
-            if op not in ("merge", "join", "concat"):
+            if op not in _MULTI_INPUT:
                 frames = frames[:1]
             before = [{"shape": _shape(f), "cols": _cols(f), "node": _node_in(f)} for f in frames]
         except Exception:
@@ -455,11 +652,12 @@ def _wrap(owner, name, op=None, inputs=None):
         finally:
             _state.busy = False
         try:
+            params = params_fn(sig, args, kwargs, op) if params_fn else None
             if result is None and frames:  # inplace
                 before[0]["after_shape"] = _shape(frames[0])
-                _record(op, args, kwargs, before, frames[0], inplace=True)
+                _record(op, args, kwargs, before, frames[0], inplace=True, params=params)
             else:
-                _record(op, args, kwargs, before, result)
+                _record(op, args, kwargs, before, result, params=params)
         except Exception:
             pass
         return result
@@ -475,7 +673,7 @@ def _wrap_io(module, name, kind):
 
     @functools.wraps(orig)
     def wrapper(*args, **kwargs):
-        if getattr(_state, "busy", False) or _PANDAS_DIR in sys._getframe(1).f_code.co_filename:
+        if getattr(_state, "busy", False) or not _from_user_code(2):
             return orig(*args, **kwargs)
         in_node = None
         if kind == "write" and args:
@@ -490,7 +688,10 @@ def _wrap_io(module, name, kind):
             _state.busy = False
         try:
             target = args[1] if kind == "write" and len(args) > 1 else (args[0] if args else None)
-            target = kwargs.get("path_or_buf", kwargs.get("path", kwargs.get("filepath_or_buffer", target)))
+            for k in ("path_or_buf", "path", "filepath_or_buffer", "source", "file"):
+                if k in kwargs:
+                    target = kwargs[k]
+                    break
             obj = args[0] if kind == "write" else result
             site = _call_site()
             rec = {

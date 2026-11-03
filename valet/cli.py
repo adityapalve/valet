@@ -57,7 +57,7 @@ send you instructions through it. Follow these rules for this project:
   only use it for standalone scratch scripts.)
 - Before each dataframe transformation (merge, filter, dedupe, groupby…), write a
   one-line `#` comment saying *why*, e.g. `# keep the latest event per user`.
-  valet records every pandas step with its shapes and shows your comment next
+  valet records every pandas and polars step with its shapes and shows your comment next
   to it, so the user can follow how the data changed.
 - If the output contains `[valet] Data warnings` (e.g. a join that multiplied
   rows), investigate and fix or explain it before moving on.

@@ -230,9 +230,9 @@ function renderDiff(diff) {
 const fmtShape = (sh) => sh ? sh.map((n) => n.toLocaleString()).join(" × ") : "?";
 function opKind(op) {
   if (op.startsWith("read:") || op.startsWith("write:")) return "k-io";
-  if (/filter|drop_duplicates|dropna|query|^drop$/.test(op)) return "k-reduce";
-  if (/merge|join|concat/.test(op)) return "k-combine";
-  if (op.startsWith("groupby") || /pivot|melt/.test(op)) return "k-agg";
+  if (/filter|drop_duplicates|dropna|drop_nulls|unique|query|^drop$/.test(op)) return "k-reduce";
+  if (/merge|join|concat|vstack|hstack/.test(op)) return "k-combine";
+  if (/^group_?by|pivot|melt|unpivot|collect/.test(op)) return "k-agg";
   return "";
 }
 function renderStep(st) {
