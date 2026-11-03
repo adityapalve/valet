@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import signal
 import subprocess
@@ -33,6 +34,8 @@ from .store import Store
 
 UI_FILE = "ui.json"
 # Bundled, served from the package so the viewer works offline (no CDN; corp networks often block them).
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+               ".webp": "image/webp"}  # no SVG: it can carry scripts
 STATIC = {"diffs.js": "text/javascript; charset=utf-8", "THIRD_PARTY_LICENSES.txt": "text/plain; charset=utf-8"}
 DEFAULT_IDLE_MINUTES = 30.0
 _no_proxy = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # corp proxies: never for localhost
@@ -208,6 +211,25 @@ def serve(store: Store, port: int = 8765, open_browser: bool = True,
         def _json(self, obj, status=200):
             self._send(json.dumps(obj).encode(), "application/json", status)
 
+        def _artifact_file(self, run_id: int, seq: int):
+            fp = store.artifact_file(run_id, seq)
+            ctype = IMAGE_TYPES.get(os.path.splitext(fp or "")[1].lower())
+            try:
+                if not fp or not ctype or os.path.getsize(fp) > 25_000_000:
+                    return self._json({"error": "not found"}, 404)
+                with open(fp, "rb") as fh:
+                    body = fh.read()
+            except OSError:
+                return self._json({"error": "file no longer exists"}, 404)
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Content-Security-Policy", "sandbox; default-src 'none'")
+            self.end_headers()
+            self.wfile.write(body)
+
         def _host_ok(self) -> bool:  # blocks DNS-rebinding attacks
             return self.headers.get("Host", "") in hosts
 
@@ -223,6 +245,9 @@ def serve(store: Store, port: int = 8765, open_browser: bool = True,
             if path == "/api/ping":
                 return self._json({"home": str(store.home.resolve()), "pid": os.getpid()})
             try:
+                m = re.fullmatch(r"/api/runs/(\d+)/artifacts/(\d+)/file", path)
+                if m:  # an image the run wrote (the only artifact files served from disk)
+                    return self._artifact_file(int(m.group(1)), int(m.group(2)))
                 if path == "/api/runs":
                     return self._json({"runs": store.list_runs(200), "pending": store.pending_notes()})
                 if path.startswith("/api/runs/"):

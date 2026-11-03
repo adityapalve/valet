@@ -23,6 +23,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from .outputs import derive_title, human_size, scan_outputs, tidy_snippet
 from .store import Store, find_home, read_trail_file, trail_file
 
 RULES = """\
@@ -35,6 +36,10 @@ send you instructions through it. Follow these rules for this project:
   - a script: `valet py path/to/script.py arg1 arg2`
   - a quick snippet: `valet py -c "..."`, or pipe the code in: in bash
     `valet py - <<'EOF' ... EOF`, in PowerShell `@' ... '@ | valet py -`
+- Give every run a short title saying what it's for, so the user can follow
+  along: `valet py --title "XCL usage check" script.py`. Anything longer than one
+  or two statements belongs in a script file in `.valet/scratch/`, one statement
+  per line, not a long `-c` one-liner joined with `;`.
 - Run other commands you want the user to see (tests, data tools, CLIs) with
   `valet run -- <command> <args>`.
 - Put throwaway scripts in `.valet/scratch/`. Edit and re-run the same file as
@@ -57,7 +62,8 @@ send you instructions through it. Follow these rules for this project:
 - If the output contains `[valet] Data warnings` (e.g. a join that multiplied
   rows), investigate and fix or explain it before moving on.
 - Print compact output: `df.head()`, `df.shape`, `df.describe()`, never whole
-  dataframes or files.
+  dataframes or files. The user sees printed and written dataframes as tables
+  in the viewer (up to 200 rows), so `print(df.head(20))` is plenty.
 - If the output ends with a `[valet] Message from the user` block, treat it as a
   direct instruction from the user that takes priority over your current plan.
 - The viewer (`valet ui`) is for the user. Don't start or stop it unless they ask;
@@ -153,10 +159,12 @@ def _write_out(text: str) -> None:
     sys.stdout.flush()
 
 
-def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None) -> int:
+def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None,
+            title: str | None = None) -> int:
     """Run argv, tee output to our stdout, record what we can. Returns the exit code."""
     cwd = os.getcwd()
-    run_id = rec.call("start_run", argv, cwd)
+    started = time.time()
+    run_id = rec.call("start_run", argv, cwd, title)
 
     # Snapshot explicit files plus any argument that is an existing text file.
     if run_id is not None:
@@ -212,19 +220,39 @@ def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None) 
         code = code if code else 130
 
     output = "".join(chunks)
-    steps = read_trail_file(trail)
+    records = read_trail_file(trail)
+    steps = [r for r in records if r.get("kind") != "artifact"]
+    captured = [r for r in records if r.get("kind") == "artifact"]
     notes: list[str] = []
+    outputs: list[dict] = []
     if run_id is not None:
         rec.call("finish_run", run_id, code, output)
         rec.call("ingest_trail", run_id)
+        # files the run created or changed that the hook didn't already capture
+        if os.environ.get("VALET_SCAN_OUTPUTS", "1") != "0":
+            known = {a["path"] for a in captured if a.get("path")} | {str(p.resolve()) for p in snapshot or []}
+            outputs = scan_outputs(cwd, started, known)
+            if outputs:
+                rec.call("set_artifacts", run_id, outputs, ("file", "image"))
         notes = rec.call("take_notes", run_id, default=[])
     trail.unlink(missing_ok=True)
 
-    trailer = f"\n[valet] run #{run_id} · exit {code}" if run_id is not None and not rec.error \
-        else f"\n[valet] exit {code} · not recorded (run `valet doctor`)"
+    # Plain ASCII from here on: the agent reads this through whatever encoding its terminal has.
+    trailer = f"\n[valet] run #{run_id} | exit {code}" if run_id is not None and not rec.error \
+        else f"\n[valet] exit {code} | not recorded (run `valet doctor`)"
     real = [st for st in steps if st["op"] != "source" and not st.get("minor")]
     if real:
-        trailer += f" · {len(real)} dataframe steps recorded"
+        trailer += f" | {len(real)} dataframe steps recorded"
+    written = [a for a in captured if a.get("type") == "write" and a.get("path")] + \
+              [a for a in outputs if a["type"] in ("file", "image")]
+    if written:
+        def describe(a: dict) -> str:
+            name = os.path.relpath(a["path"], cwd) if a["path"].startswith(cwd) else a["path"]
+            if a.get("shape"):
+                return f"{name} ({a['shape'][0]:,} x {a['shape'][1]})"
+            return f"{name} ({human_size(a['size'])})" if a.get("size") else name
+        shown = ", ".join(describe(a) for a in written[:4])
+        trailer += f"\n[valet] outputs: {shown}" + (f" and {len(written) - 4} more" if len(written) > 4 else "")
     warnings = [
         f"  - {w}  ({Path(st['site']['file']).name}:{st['site']['line']})" if st.get("site") else f"  - {w}"
         for st in steps for w in st.get("warnings") or []
@@ -238,9 +266,19 @@ def execute(rec: Recorder, argv: list[str], snapshot: list[Path] | None = None) 
     return code
 
 
+def _take_title(args: list[str]) -> tuple[str | None, list[str]]:
+    """Pull a leading `--title TEXT` (or `--title=TEXT`) off the argument list."""
+    if args and args[0] == "--title" and len(args) > 1:
+        return args[1], args[2:]
+    if args and args[0].startswith("--title="):
+        return args[0].split("=", 1)[1], args[1:]
+    return None, args
+
+
 def cmd_py(store: Recorder, args: list[str]) -> int:
+    title, args = _take_title(args)
     if not args:
-        sys.exit("usage: valet py SCRIPT [ARGS...] | valet py -c CODE | valet py - < code")
+        sys.exit("usage: valet py [--title TEXT] SCRIPT [ARGS...] | valet py -c CODE | valet py - < code")
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     if args[0] in ("-c", "-"):
         if args[0] == "-c":
@@ -254,18 +292,23 @@ def cmd_py(store: Recorder, args: list[str]) -> int:
         while script.exists():
             n += 1
             script = store.home / "scratch" / f"snippet-{stamp}-{n}.py"
-        script.write_text(code, encoding="utf-8")
+        # one statement per line, so the snippet is readable in the viewer (same program, checked)
+        script.write_text(tidy_snippet(code), encoding="utf-8")
         print(f"[valet] saved snippet to {script}", flush=True)
-        return execute(store, [*python_cmd(script), str(script), *rest], snapshot=[script])
-    return execute(store, [*python_cmd(Path(args[0])), *args])
+        title = title or derive_title(script, is_snippet=True)
+        return execute(store, [*python_cmd(script), str(script), *rest], snapshot=[script], title=title)
+    first = Path(args[0])
+    title = title or (derive_title(first, is_snippet=False) if first.suffix == ".py" else None)
+    return execute(store, [*python_cmd(first), *args], title=title)
 
 
 def cmd_run(store: Recorder, args: list[str]) -> int:
+    title, args = _take_title(args)
     if args and args[0] == "--":
         args = args[1:]
     if not args:
-        sys.exit("usage: valet run -- COMMAND [ARGS...]")
-    return execute(store, args)
+        sys.exit("usage: valet run [--title TEXT] -- COMMAND [ARGS...]")
+    return execute(store, args, title=title)
 
 
 def cmd_note(store: Store, text: str) -> int:
@@ -322,7 +365,7 @@ def cmd_show(store: Store, run_id: int | None, full: bool) -> int:
 def fmt_shape(shape) -> str:
     if not shape:
         return "?"
-    return " × ".join(f"{n:,}" for n in shape)
+    return " x ".join(f"{n:,}" for n in shape)
 
 
 def format_step(st: dict) -> str:
@@ -331,7 +374,7 @@ def format_step(st: dict) -> str:
         return f"source {node.get('label', '?')}  {fmt_shape(st.get('output'))}"
     params = ", ".join(f"{k}={v}" for k, v in (st.get("params") or {}).items())
     ins = " + ".join(fmt_shape(i.get("shape")) for i in st.get("inputs") or [])
-    line = f"{st['op']}({params})  {ins + ' → ' if ins else ''}{fmt_shape(st.get('output'))}"
+    line = f"{st['op']}({params})  {ins + ' -> ' if ins else ''}{fmt_shape(st.get('output'))}"
     if st.get("cols_added"):
         line += f"  +cols {st['cols_added']}"
     if st.get("cols_removed"):

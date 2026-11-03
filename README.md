@@ -23,8 +23,12 @@ the terminal exactly as before, so the agent's own terminal tool sees it, and on
   why, and linked into a tree of which frame came from which. Click any node for a Data
   Wrangler-style preview (column types, % missing, sample rows). Joins that multiply rows are
   flagged, to you *and* to the agent.
+- **Outputs as tables**: every DataFrame a run writes (`write_csv`, `to_parquet`, ...) or prints
+  (`print(df.head(20))`), from pandas or polars, shows up as a sortable, filterable table with
+  column types and % missing, compared against the same file from the previous run. CSV/TSV files
+  and images (plots) written any other way are picked up too.
 - **A live viewer**: `valet ui` serves a local page showing the run timeline, script
-  diffs, the data trail, streaming output and queued notes.
+  diffs, outputs, the data trail, streaming output and queued notes.
 
 ![viewer](docs/viewer.png)
 
@@ -156,6 +160,34 @@ error paths) queries stayed open, so the viewer held a write lock for as long as
 closes it. The test suite checks this under PyPy too. If an old viewer is still running, end
 that python process (or log out), then update.
 
+### Outputs
+
+![output table](docs/outputs.png)
+
+- **Captured from the frame in memory.** When a pandas or polars DataFrame is written or printed
+  from your code, the hook records its shape, column dtypes, null counts and first 200 rows, so it
+  works for any format (CSV, parquet, Excel...). Printed frames keep a meaningful index (e.g. after
+  a groupby).
+- **Found on disk.** After each run, valet looks for CSV/TSV, image and other data files under the
+  run's folder that changed during the run (skipping `.git`, `.valet`, virtualenvs and other
+  hidden folders; at most 1.5s and 20 files). CSV/TSV files get a table preview with a row count;
+  images (PNG, JPEG, GIF, WebP) are displayed. Turn it off with `VALET_SCAN_OUTPUTS=0`.
+- **Compared to last time.** An output is compared with the same path in the previous run that
+  produced it: rows added or removed, columns added or removed.
+- **Told to the agent.** The run summary lists the outputs, e.g.
+  `[valet] outputs: output/xcl_usage.csv (13,043 x 22)`.
+- Sorting and filtering apply to the preview rows (the first 200). Previews are stored in
+  `.valet/`; set `VALET_TRAIL_PROFILE=0` to keep data out of it, or `VALET_MAX_ARTIFACTS` to change
+  the per-run limit (default 20).
+
+### Run titles and snippets
+
+Each run gets a readable title in the viewer: `valet py --title "XCL usage check" ...`, otherwise
+the script's leading `#` comment or docstring, otherwise (for `-c` snippets) its first meaningful
+statement. A one-line snippet like `import x; y = f(); print(y)` is saved one statement per line,
+but only when the reformatted code parses to exactly the same program; it is the version that runs.
+All text valet adds to the agent's output is plain ASCII, so Windows consoles show it correctly.
+
 ### Reviewing scripts
 
 ![script diff](docs/scripts.png)
@@ -196,7 +228,7 @@ command's output is the most reliable channel available.
 - **Replay ("durable" state)**: valet already stores every script version in run order, so a
   crashed or reset session (or kernel) can be rebuilt with `valet replay --until 12`. Optionally,
   checkpoint DataFrames to parquet at chosen steps so replay can resume from there.
-- **Data trail, more**: polars support; null-rate and key-uniqueness checks on join keys;
+- **Data trail, more**: polars transformation steps (outputs are already captured); null-rate and key-uniqueness checks on join keys;
   `df.loc[mask, col] = …` updates; collapsing long runs of column assignments; a tree that spans
   runs (follow `report.csv` from the script that wrote it into the one that reads it).
 - **Optional MCP front-end** over the same store, for agents/IDEs where MCP is available.

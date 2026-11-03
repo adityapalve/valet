@@ -132,6 +132,36 @@ pre.code span { display: block; }
 .preview .nullbar i { display: block; height: 100%; background: var(--bad); border-radius: 2px; }
 .preview .nulltxt { font-weight: 400; font-size: 10.5px; color: var(--muted); }
 .legend { font-size: 11.5px; color: var(--muted); }
+.run .title { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px; }
+.run .title + .cmd { color: var(--muted); font-size: 11px; }
+.badge-out { font-size: 11px; color: var(--muted); margin-left: 6px; }
+.run-title { font-size: 17px; font-weight: 650; margin: 0 0 4px; overflow-wrap: anywhere; }
+.art { border: 1px solid var(--line); border-radius: 6px; background: var(--panel); margin-bottom: 12px; overflow: hidden; }
+.art-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.art-kind { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.art-name { font-family: var(--mono); font-weight: 600; font-size: 13px; overflow-wrap: anywhere; }
+.art-shape { font-family: var(--mono); font-size: 12.5px; }
+.art-meta { font-size: 12px; color: var(--muted); }
+.art-cmp { font-size: 12px; } .art-cmp .up { color: var(--accent); } .art-cmp .down { color: var(--bad); }
+.art-head .loc { margin-left: auto; font-family: var(--mono); font-size: 11.5px; color: var(--muted); }
+.art-tools { display: flex; gap: 10px; align-items: center; padding: 6px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.art-tools input { padding: 4px 8px; border: 1px solid var(--line); border-radius: 5px; background: var(--bg);
+  color: var(--ink); font: inherit; font-size: 12.5px; min-width: 0; width: 220px; max-width: 100%; }
+.art-tools .meta { margin: 0; }
+.grid { max-height: 420px; overflow: auto; }
+.grid table { border-collapse: collapse; font-family: var(--mono); font-size: 12px; min-width: 100%; }
+.grid th, .grid td { padding: 3px 10px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line); }
+.grid thead th { position: sticky; top: 0; background: var(--bg); font-weight: 600; cursor: pointer; user-select: none; z-index: 1; }
+.grid thead th:hover { color: var(--accent); }
+.grid th .dtype { font-weight: 400; color: var(--muted); font-size: 11px; }
+.grid th .nulltxt { font-weight: 400; font-size: 10.5px; color: var(--muted); }
+.grid th .nullbar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 3px; }
+.grid th .nullbar i { display: block; height: 100%; background: var(--bad); border-radius: 2px; }
+.grid td.rn, .grid th.rn { color: var(--muted); text-align: right; cursor: default; }
+.grid td.num { text-align: right; }
+.grid tbody tr:nth-child(even) td { background: color-mix(in srgb, var(--bg) 50%, transparent); }
+.art img { display: block; max-width: 100%; height: auto; margin: 0 auto; background: #fff; }
+.art .err { padding: 8px 12px; color: var(--bad); font-size: 12.5px; }
 .note-delivered { border-left: 3px solid var(--run); padding: 6px 10px; background: var(--panel);
   margin-top: 6px; border-radius: 0 6px 6px 0; }
 label.follow { font-size: 12px; color: var(--muted); display: flex; gap: 4px; align-items: center; }
@@ -163,8 +193,25 @@ let selected = null, lastDetailKey = "", fileView = {};
 
 function status(r) { return r.exit_code === null ? "run" : (r.exit_code === 0 ? "ok" : "bad"); }
 function ago(ts) { return new Date(ts * 1000).toLocaleTimeString(); }
-function shortCmd(argv) {
-  return argv.map((a, i) => i === 0 ? a.split(/[\\/]/).pop() : (a.includes("/.valet/scratch/") ? "scratch/" + a.split("/").pop() : a)).join(" ");
+// Paths may be POSIX or Windows (C:\...). Show them relative to the run's folder, with "/".
+function relPath(p, cwd) {
+  if (!p) return "";
+  const P = p.replace(/\\/g, "/"), C = (cwd || "").replace(/\\/g, "/").replace(/\/$/, "");
+  const win = /^[a-z]:\//i.test(P);
+  const under = C && (win ? P.toLowerCase().startsWith(C.toLowerCase() + "/") : P.startsWith(C + "/"));
+  return under ? P.slice(C.length + 1) : P;
+}
+// "C:\...\uv.EXE run python C:\proj\.valet\scratch\snippet-1.py" -> "snippet-1.py"
+function shortCmd(argv, cwd) {
+  const base = (x) => x.split(/[\\/]/).pop().toLowerCase().replace(/\.exe$/, "");
+  let a = argv.slice();
+  if (a.length && base(a[0]) === "uv") {
+    a = a.slice(1);
+    if (a[0] === "run") a = a.slice(1);
+    while (a.length && a[0].startsWith("--")) a = a.slice(1);
+  }
+  if (a.length > 1 && /^(python[\d.]*|pypy[\d.]*|py)$/.test(base(a[0]))) a = a.slice(1);
+  return a.map((x) => /[\\/]\.valet[\\/]scratch[\\/]/.test(x) ? x.split(/[\\/]/).pop() : relPath(x, cwd)).join(" ");
 }
 
 function renderDiff(diff) {
@@ -363,7 +410,7 @@ function viewFor(f, key) {
 }
 
 function renderFile(f, runId, cwd) {
-  const shown = f.path.startsWith(cwd + "/") ? f.path.slice(cwd.length + 1) : f.path;
+  const shown = relPath(f.path, cwd);
   const key = runId + f.path;
   const view = viewFor(f, key);
   const tab = (v, label) => `<button class="${view === v ? "" : "ghost"}" data-key="${esc(key)}" data-view="${v}">${label}</button>`;
@@ -379,6 +426,119 @@ function renderFile(f, runId, cwd) {
   return `<div class="fhead"><span class="fname" title="${esc(f.path)}">${esc(shown)}</span>
       <span class="ver">v${f.version || 1}</span>${countHtml}${tabs}</div>
     ${unchanged}<div class="filemount" data-mkey="${esc(mkey)}" data-key="${esc(key)}"></div>`;
+}
+
+
+// ---- outputs: frames written or printed, files and images the run produced ----------------
+const artCache = new Map();   // key -> element (keeps sort/filter state across polls)
+const KIND = { write: "written", print: "printed", file: "file", image: "image" };
+const isNum = (v) => v !== "" && v !== "None" && v !== "null" && !isNaN(Number(String(v).replace(/,/g, "")));
+
+function artKey(r, a) { return [r.id, a.seq, (a.shape || []).join("x"), (a.rows || []).length, a.size].join(":"); }
+
+function renderOutputs(r) {
+  const arts = r.artifacts || [];
+  if (!arts.length) return "";
+  return `<h2>outputs <span class="meta">${arts.length}</span></h2>` +
+    arts.map((a) => `<div class="artslot" data-akey="${esc(artKey(r, a))}"></div>`).join("");
+}
+
+function compareHtml(a) {
+  const p = a.prev;
+  if (!p) return "";
+  const bits = [];
+  if (p.shape && a.shape) {
+    const dr = a.shape[0] - p.shape[0];
+    if (dr) bits.push(`<span class="${dr > 0 ? "up" : "down"}">${dr > 0 ? "+" : "−"}${Math.abs(dr).toLocaleString()} rows</span>`);
+    const was = new Set(p.columns || []), now = new Set(a.columns || []);
+    const added = (a.columns || []).filter((c) => !was.has(c)), removed = (p.columns || []).filter((c) => !now.has(c));
+    if (added.length) bits.push(`<span class="up">+${added.length} col${added.length > 1 ? "s" : ""} (${esc(added.slice(0, 4).join(", "))})</span>`);
+    if (removed.length) bits.push(`<span class="down">−${removed.length} col${removed.length > 1 ? "s" : ""} (${esc(removed.slice(0, 4).join(", "))})</span>`);
+    if (!bits.length) bits.push("same shape and columns");
+  } else if (p.size != null && a.size != null) {
+    bits.push(p.size === a.size ? "same size" : `was ${p.size.toLocaleString()} bytes`);
+  }
+  return `<span class="art-cmp">vs run #${p.run_id}: ${bits.join(" · ")}</span>`;
+}
+
+function buildArtifact(a, r) {
+  const el = document.createElement("div");
+  el.className = "art";
+  const site = a.site || {};
+  const loc = site.file ? `${site.file.split(/[\\/]/).pop()}:${site.line}` : "";
+  const name = a.path ? relPath(a.path, r.cwd) : `printed at ${loc}`;
+  const shape = a.shape ? `${a.rows_estimated ? "≈" : ""}${a.shape[0].toLocaleString()} rows × ${a.shape[1]} cols` : "";
+  const size = a.size != null && !a.shape ? `<span class="art-meta">${(a.size / 1024).toFixed(a.size < 10240 ? 1 : 0)} KB</span>` : "";
+  el.innerHTML = `<div class="art-head"><span class="art-kind">${KIND[a.type] || a.type}</span>
+      <span class="art-name" title="${esc(a.path || "")}">${esc(name)}</span>
+      ${shape ? `<span class="art-shape">${shape}</span>` : ""}${size}
+      ${a.lib ? `<span class="art-meta">${esc(a.lib)}</span>` : ""}${compareHtml(a)}
+      ${a.type === "write" && loc ? `<span class="loc">${esc(loc)}</span>` : ""}</div>`;
+  if (a.error) { el.insertAdjacentHTML("beforeend", `<div class="err">couldn't preview: ${esc(a.error)}</div>`); return el; }
+  if (a.type === "image") {
+    el.insertAdjacentHTML("beforeend", `<img loading="lazy" alt="${esc(name)}" src="/api/runs/${r.id}/artifacts/${a.seq}/file">`);
+    return el;
+  }
+  if (!a.columns) return el;   // e.g. a parquet file written some other way: listed, no preview
+
+  const rows = a.rows || [];
+  const state = { sort: null, dir: 1, q: "" };
+  const shown = rows.length < (a.shape ? a.shape[0] : 0)
+    ? `first ${rows.length.toLocaleString()} of ${a.rows_estimated ? "≈" : ""}${a.shape[0].toLocaleString()} rows` : `${rows.length.toLocaleString()} rows`;
+  // numeric = right-aligned and sorted as numbers. Trust the dtype when we have one: a String
+  // column of codes like "010" must stay text (leading zeros, text sort).
+  const numCol = a.columns.map((_, i) => {
+    const dt = (a.dtypes || [])[i];
+    if (dt) return /^(u?int|float|decimal|double|number)/i.test(dt);
+    return rows.length > 0 && rows.every((r) => r[i] === "" || r[i] === "None" || r[i] === "null" || isNum(r[i]));
+  });
+  el.insertAdjacentHTML("beforeend", `<div class="art-tools">
+      <input type="search" placeholder="filter rows…" aria-label="filter rows">
+      <span class="meta count">${shown}${a.more_columns ? ` · +${a.more_columns} more columns` : ""}</span></div>
+    <div class="grid"><table><thead><tr><th class="rn">#</th>${a.columns.map((c, i) => {
+      const nulls = a.nulls ? a.nulls[i] : null, n = a.shape ? a.shape[0] : rows.length;
+      const pct = nulls != null && n ? 100 * nulls / n : 0;
+      return `<th data-col="${i}" title="sort by ${esc(c)}">${esc(c)} <span class="dtype">${esc((a.dtypes || [])[i] || "")}</span>${
+        nulls == null ? "" : `<div class="nulltxt">${nulls ? pct.toFixed(1) + "% missing" : "no missing"}</div><div class="nullbar"><i style="width:${Math.min(100, pct)}%"></i></div>`}</th>`;
+    }).join("")}</tr></thead><tbody></tbody></table></div>`);
+  const tbody = el.querySelector("tbody"), count = el.querySelector(".count");
+  const draw = () => {
+    let list = rows.map((r, i) => [i, r]);
+    if (state.q) { const q = state.q.toLowerCase(); list = list.filter(([, r]) => r.some((v) => String(v).toLowerCase().includes(q))); }
+    if (state.sort !== null) {
+      const c = state.sort, num = numCol[c];
+      list.sort(([, x], [, y]) => state.dir * (num ? (Number(String(x[c]).replace(/,/g, "")) || 0) - (Number(String(y[c]).replace(/,/g, "")) || 0)
+                                               : String(x[c]).localeCompare(String(y[c]))));
+    }
+    tbody.innerHTML = list.map(([i, r]) => `<tr><td class="rn">${i + 1}</td>${r.map((v, c) =>
+      `<td class="${numCol[c] ? "num" : ""}">${esc(v)}</td>`).join("")}</tr>`).join("");
+    count.textContent = (state.q ? `${list.length} matching · ` : "") + shown +
+      (state.sort !== null ? ` · sorted by ${a.columns[state.sort]} ${state.dir > 0 ? "↑" : "↓"} (preview rows only)` : "") +
+      (a.more_columns ? ` · +${a.more_columns} more columns` : "");
+  };
+  el.querySelector("thead").addEventListener("click", (e) => {
+    const th = e.target.closest("th[data-col]"); if (!th) return;
+    const c = +th.dataset.col;
+    state.dir = state.sort === c ? -state.dir : 1; state.sort = c; draw();
+  });
+  el.querySelector("input").addEventListener("input", (e) => { state.q = e.target.value; draw(); });
+  draw();
+  return el;
+}
+
+function mountOutputs(r) {
+  const used = new Set();
+  document.querySelectorAll(".artslot").forEach((slot) => {
+    const k = slot.dataset.akey; used.add(k);
+    let el = artCache.get(k);
+    if (!el) {
+      const a = (r.artifacts || []).find((x) => artKey(r, x) === k);
+      el = buildArtifact(a, r);
+      artCache.set(k, el);
+    }
+    slot.replaceWith(el);
+  });
+  for (const k of artCache.keys()) if (!used.has(k)) artCache.delete(k);
 }
 
 function renderFileBar(files) {
@@ -434,6 +594,7 @@ async function loadDetail(force) {
   const r = await (await fetch(`/api/runs/${selected}`)).json();
   if (r.error) return;
   const key = JSON.stringify([r.id, r.exit_code, r.output.length, (r.trail || []).length, fileView, [...openNodes],
+                             (r.artifacts || []).map((a) => a.seq + ":" + (a.shape || []).join("x")).join(","),
                              diffStyle, wrapLines, !!Diffs]);
   if (!force && key === lastDetailKey) return;
   lastDetailKey = key;
@@ -441,15 +602,18 @@ async function loadDetail(force) {
   const atBottom = outEl && outEl.scrollTop + outEl.clientHeight >= outEl.scrollHeight - 20;
   const st = status(r);
   $("#detail").innerHTML = `
+    ${r.title ? `<div class="run-title">${esc(r.title)}</div>` : ""}
     <div class="meta"><span class="dot ${st}"></span>run #${r.id} · ${ago(r.started)} ·
       ${r.exit_code === null ? "running…" : "exit " + r.exit_code} ${r.duration != null ? "· " + r.duration.toFixed(1) + "s" : ""} · ${esc(r.cwd)}</div>
     <div class="cmdline">$ ${esc(r.argv.join(" "))}</div>
     ${renderFileBar(r.files)}${r.files.map((f) => renderFile(f, r.id, r.cwd)).join("")}
+    ${renderOutputs(r)}
     ${renderTrail(r.trail, r.id)}
     <h2>output ${r.truncated ? '<span class="meta">(truncated)</span>' : ""}</h2>
     <pre class="code" id="out">${esc(r.output) || '<span class="meta">(no output)</span>'}</pre>
     ${r.notes.map((n) => `<div class="note-delivered"><b>delivered to agent:</b> ${esc(n.text)}</div>`).join("")}`;
   mountFiles(r);
+  mountOutputs(r);
   drawEdges();
   const o = document.getElementById("out");
   if (atBottom || r.exit_code === null) o.scrollTop = o.scrollHeight;
@@ -461,8 +625,10 @@ async function tick() {
     if (runs.length && (selected === null || $("#follow").checked)) selected = runs[0].id;
     $("#runs").innerHTML = runs.map((r) => `
       <div class="run ${r.id === selected ? "sel" : ""}" data-id="${r.id}">
-        <div class="top"><span><span class="dot ${status(r)}"></span>#${r.id}${r.trail_warnings ? `<span class="badge-warn">⚠ ${r.trail_warnings}</span>` : ""}</span><span>${ago(r.started)}</span></div>
-        <div class="cmd" title="${esc(r.argv.join(" "))}">${esc(shortCmd(r.argv))}</div>
+        <div class="top"><span><span class="dot ${status(r)}"></span>#${r.id}${r.trail_warnings ? `<span class="badge-warn">⚠ ${r.trail_warnings}</span>` : ""}${
+          r.n_artifacts ? `<span class="badge-out" title="outputs">▦ ${r.n_artifacts}</span>` : ""}</span><span>${ago(r.started)}</span></div>
+        ${r.title ? `<div class="title" title="${esc(r.title)}">${esc(r.title)}</div>` : ""}
+        <div class="cmd" title="${esc(r.argv.join(" "))}">${esc(shortCmd(r.argv, r.cwd))}</div>
       </div>`).join("");
     $("#pending").innerHTML = pending.map((n) =>
       `<span class="chip">queued: ${esc(n.text)}<b data-del="${n.id}" title="withdraw">×</b></span>`).join("");

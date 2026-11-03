@@ -25,7 +25,7 @@ def test_script_run_is_recorded_and_versioned(tmp_path):
     script.write_text("print('hello')\n")
     r = valet(tmp_path, "py", "probe.py")
     assert r.returncode == 0
-    assert "hello" in r.stdout and "[valet] run #1 · exit 0" in r.stdout
+    assert "hello" in r.stdout and "[valet] run #1 | exit 0" in r.stdout
 
     script.write_text("import sys\nprint('v2')\nsys.exit(3)\n")
     r = valet(tmp_path, "py", "probe.py")
@@ -392,3 +392,82 @@ def test_script_versions_and_bundled_diff_renderer(tmp_path):
     finally:
         proc.terminate()
         proc.wait()
+
+
+# ---- outputs: frames written / printed, files scanned, titles, tidy snippets --------------
+
+@pytest.mark.skipif(importlib.util.find_spec("polars") is None, reason="polars not installed")
+def test_polars_writes_and_prints_become_artifacts(tmp_path):
+    (tmp_path / "out").mkdir()
+    (tmp_path / "s.py").write_text(
+        "# XCL usage check\n"
+        "import polars as pl\n"
+        "df = pl.DataFrame({'base': ['A', 'B', None], 'vl': [1, 2, 3]})\n"
+        "print(df)\n"
+        "df.write_csv('out/usage.csv')\n")
+    r = valet(tmp_path, "py", "s.py")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "[valet] outputs: out/usage.csv (3 x 2)" in r.stdout.replace("\\", "/")
+    assert r.stdout.isascii() or "\u2502" in r.stdout  # valet's own lines are ASCII (polars draws boxes)
+    run = _run_json(tmp_path, 1)
+    assert run["title"] == "XCL usage check"
+    types = [a["type"] for a in run["artifacts"]]
+    assert types == ["print", "write"]  # the CSV was captured by the hook, so the scan skips it
+    printed, written = run["artifacts"]
+    assert printed["lib"] == "polars" and printed["shape"] == [3, 2] and printed["site"]["line"] == 4
+    assert written["columns"] == ["base", "vl"] and written["nulls"] == [1, 0]
+    assert written["rows"][0] == ["A", "1"] and written["path"].endswith("usage.csv")
+
+    # same file in the next run: compared against the previous run's version
+    (tmp_path / "s.py").write_text("import polars as pl\n"
+                                   "pl.DataFrame({'base': ['A'], 'vl': [1], 'x': [0]}).write_csv('out/usage.csv')\n")
+    valet(tmp_path, "py", "s.py")
+    art = _run_json(tmp_path, 2)["artifacts"][0]
+    assert art["prev"]["run_id"] == 1 and art["prev"]["shape"] == [3, 2] and art["shape"] == [1, 3]
+
+
+@pytest.mark.skipif(importlib.util.find_spec("pandas") is None, reason="pandas not installed")
+def test_pandas_print_keeps_meaningful_index(tmp_path):
+    (tmp_path / "s.py").write_text(
+        "import pandas as pd\n"
+        "df = pd.DataFrame({'team': ['a', 'a', 'b'], 'm': [1, 2, 3]})\n"
+        "print(df.groupby('team')['m'].sum().to_frame())\n")
+    assert valet(tmp_path, "py", "s.py").returncode == 0
+    (art,) = _run_json(tmp_path, 1)["artifacts"]
+    assert art["type"] == "print" and art["columns"] == ["team", "m"] and art["rows"] == [["a", "3"], ["b", "3"]]
+
+
+def test_scan_finds_csv_and_images_written_any_way(tmp_path):
+    (tmp_path / "old.csv").write_text("a\n1\n")      # existed before the run: not an output
+    import os, time
+    os.utime(tmp_path / "old.csv", (time.time() - 3600, time.time() - 3600))
+    (tmp_path / "s.py").write_text(
+        "import csv\n"
+        "with open('report.csv', 'w', newline='') as f:\n"
+        "    w = csv.writer(f); w.writerow(['id', 'score', 'when'])\n"
+        "    [w.writerow([i, i / 2 if i % 3 else '', '2026-11-0' + str(1 + i % 9)]) for i in range(500)]\n"
+        "open('chart.png', 'wb').write(b'\\x89PNG fake')\n")
+    r = valet(tmp_path, "py", "s.py")
+    assert "report.csv (500 x 3)" in r.stdout and "chart.png" in r.stdout
+    arts = {os.path.basename(a["path"]): a for a in _run_json(tmp_path, 1)["artifacts"]}
+    assert set(arts) == {"report.csv", "chart.png"}
+    rep = arts["report.csv"]
+    assert rep["lib"] == "csv" and rep["shape"] == [500, 3] and len(rep["rows"]) == 200
+    assert rep["dtypes"] == ["int", "float", "date"] and rep["nulls"] == [0, 167, 0]
+    assert arts["chart.png"]["type"] == "image"
+
+
+def test_snippets_are_tidied_and_titled(tmp_path):
+    code = "import sys; x = [i * 2 for i in range(3)]; total = sum(x); print(f'total {total}')"
+    r = valet(tmp_path, "py", "-c", code)
+    assert "total 6" in r.stdout
+    saved = next((tmp_path / ".valet" / "scratch").glob("snippet-*.py")).read_text()
+    assert saved.splitlines() == ["import sys", "x = [i * 2 for i in range(3)]", "total = sum(x)",
+                                  "print(f'total {total}')"]
+    assert _run_json(tmp_path, 1)["title"] == "x = [i * 2 for i in range(3)]"
+    valet(tmp_path, "py", "--title", "Sum check", "-c", "print(1); print(2)")
+    assert _run_json(tmp_path, 2)["title"] == "Sum check"
+    # code that can't be parsed by this Python is left exactly as written
+    valet(tmp_path, "py", "-c", "print(1); def (")
+    assert any(p.read_text() == "print(1); def ("
+               for p in (tmp_path / ".valet" / "scratch").glob("snippet-*.py"))

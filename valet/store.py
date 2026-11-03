@@ -32,6 +32,15 @@ CREATE TABLE IF NOT EXISTS files (
     hash TEXT NOT NULL REFERENCES blobs(hash),
     PRIMARY KEY (run_id, path)
 );
+CREATE TABLE IF NOT EXISTS artifacts (
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    seq INTEGER NOT NULL,        -- order within the run
+    type TEXT NOT NULL,          -- write | print | file | image
+    path TEXT,                   -- absolute path for files, NULL for printed frames
+    data TEXT NOT NULL,          -- JSON: shape, columns, dtypes, nulls, rows, site, size...
+    PRIMARY KEY (run_id, seq)
+);
+CREATE INDEX IF NOT EXISTS artifacts_path ON artifacts(path);
 CREATE TABLE IF NOT EXISTS notes (
     id INTEGER PRIMARY KEY,
     created REAL NOT NULL,
@@ -80,6 +89,9 @@ class Store:
                 with _tx(con):
                     _x(con, "ALTER TABLE runs ADD COLUMN trail TEXT")
                     _x(con, "ALTER TABLE runs ADD COLUMN trail_warnings INTEGER NOT NULL DEFAULT 0")
+            if "title" not in cols:  # added in 0.6: a human-readable name for the run
+                with _tx(con):
+                    _x(con, "ALTER TABLE runs ADD COLUMN title TEXT")
 
     @contextmanager
     def _connect(self):
@@ -98,10 +110,10 @@ class Store:
             yield con
 
     # ---- runs -------------------------------------------------------------
-    def start_run(self, argv: list[str], cwd: str) -> int:
+    def start_run(self, argv: list[str], cwd: str, title: str | None = None) -> int:
         with self._write() as con:
-            return _x(con, "INSERT INTO runs (started, cwd, argv) VALUES (?, ?, ?)",
-                      (time.time(), cwd, json.dumps(argv)))
+            return _x(con, "INSERT INTO runs (started, cwd, argv, title) VALUES (?, ?, ?, ?)",
+                      (time.time(), cwd, json.dumps(argv), title))
 
     def snapshot(self, run_id: int, path: Path) -> bool:
         try:
@@ -125,14 +137,42 @@ class Store:
         return trail_file(self.home, run_id)
 
     def ingest_trail(self, run_id: int) -> list[dict]:
-        """Copy the run's trail file (written by the hook) into the database."""
-        steps = read_trail_file(self.trail_path(run_id))
+        """Copy the run's trail file (written by the hook) into the database. The file holds
+        dataframe steps and artifacts (frames written or printed); steps are returned."""
+        records = read_trail_file(self.trail_path(run_id))
+        steps = [r for r in records if r.get("kind") != "artifact"]
+        artifacts = [r for r in records if r.get("kind") == "artifact"]
         if steps:
             n_warn = sum(len(st.get("warnings") or []) for st in steps)
             with self._write() as con:
                 _x(con, "UPDATE runs SET trail = ?, trail_warnings = ? WHERE id = ?",
                    (json.dumps(steps), n_warn, run_id))
+        if artifacts:
+            self.set_artifacts(run_id, artifacts, replace_types=("write", "print"))
         return steps
+
+    def set_artifacts(self, run_id: int, artifacts: list[dict], replace_types=("write", "print")) -> None:
+        """Store artifacts for a run, replacing earlier ones of the same types (idempotent)."""
+        with self._write() as con:
+            ph = ",".join("?" * len(replace_types))
+            _x(con, f"DELETE FROM artifacts WHERE run_id = ? AND type IN ({ph})", (run_id, *replace_types))
+            start = _q(con, "SELECT COALESCE(MAX(seq), 0) FROM artifacts WHERE run_id = ?", (run_id,))[0][0]
+            for i, a in enumerate(artifacts, start + 1):
+                data = {k: v for k, v in a.items() if k not in ("kind", "type", "path")}
+                _x(con, "INSERT INTO artifacts (run_id, seq, type, path, data) VALUES (?, ?, ?, ?, ?)",
+                   (run_id, i, a["type"], a.get("path"), json.dumps(data, default=str)))
+
+    def artifact_paths(self, run_id: int) -> set[str]:
+        with self._connect() as con:
+            return {r[0] for r in _q(con, "SELECT path FROM artifacts WHERE run_id = ? AND path IS NOT NULL",
+                                     (run_id,))}
+
+    def artifact_file(self, run_id: int, seq: int) -> str | None:
+        """Path of an image artifact (the only kind the viewer serves from disk)."""
+        with self._connect() as con:
+            rows = _q(con, "SELECT path FROM artifacts WHERE run_id = ? AND seq = ? AND type = 'image'",
+                      (run_id, seq))
+        return rows[0][0] if rows else None
 
     def finish_run(self, run_id: int, exit_code: int, output: str) -> None:
         with self._write() as con:
@@ -143,7 +183,8 @@ class Store:
 
     def list_runs(self, limit: int = 50) -> list[dict]:
         with self._connect() as con:
-            rows = _q(con, "SELECT id, started, duration, cwd, argv, exit_code, trail_warnings "
+            rows = _q(con, "SELECT id, started, duration, cwd, argv, exit_code, trail_warnings, title, "
+                           "(SELECT COUNT(*) FROM artifacts a WHERE a.run_id = runs.id) AS n_artifacts "
                            "FROM runs ORDER BY id DESC LIMIT ?", (limit,))
         return [dict(r, argv=json.loads(r["argv"])) for r in rows]
 
@@ -185,6 +226,17 @@ class Store:
                         fromfile=f"run {first['run_id']}", tofile=f"run {run_id}"))
                     if first and prev and first["run_id"] != prev["run_id"] else None,
                 })
+            run["artifacts"] = []
+            for a in _q(con, "SELECT seq, type, path, data FROM artifacts WHERE run_id = ? ORDER BY seq", (run_id,)):
+                art = {"seq": a["seq"], "type": a["type"], "path": a["path"], **json.loads(a["data"])}
+                if a["path"]:  # the same file in an earlier run, to show what changed
+                    prev = _q(con, "SELECT run_id, data FROM artifacts WHERE path = ? AND run_id < ? "
+                                   "ORDER BY run_id DESC LIMIT 1", (a["path"], run_id))
+                    if prev:
+                        pd_ = json.loads(prev[0]["data"])
+                        art["prev"] = {"run_id": prev[0]["run_id"], "shape": pd_.get("shape"),
+                                       "columns": pd_.get("columns"), "size": pd_.get("size")}
+                run["artifacts"].append(art)
             run["notes"] = [dict(n) for n in _q(
                 con, "SELECT id, created, text FROM notes WHERE delivered_run = ? ORDER BY id", (run_id,))]
         return run

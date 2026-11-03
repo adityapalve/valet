@@ -198,6 +198,122 @@ def _out_label(site, inplace, parent):
     return m.group(1) if m else _labels.get(parent) or "frame"
 
 
+# ---- artifacts: frames the script writes to a file or prints --------------------------
+
+_MAX_ARTIFACTS = int(os.environ.get("VALET_MAX_ARTIFACTS", "20"))
+_PREVIEW_ROWS = 200
+_PREVIEW_COLS = 60
+_artifact_count = [0]
+_LIB_DIRS = tuple(os.sep + d + os.sep for d in ("pandas", "polars", "numpy", "site-packages", "dist-packages"))
+
+
+def _from_user_code(depth=2):
+    """True if the frame `depth` levels up is the user's code (not a library or this hook)."""
+    try:
+        fn = sys._getframe(depth).f_code.co_filename
+    except ValueError:
+        return False
+    return not (fn == __file__ or any(d in fn for d in _LIB_DIRS))
+
+
+def _snapshot(obj, lib):
+    """Shape, columns, dtypes, null counts and the first rows of a pandas or polars frame."""
+    prev = getattr(_state, "busy", False)
+    _state.busy = True
+    try:
+        if lib == "polars":
+            cols = obj.columns[:_PREVIEW_COLS]
+            sub = obj.select(cols) if len(obj.columns) > _PREVIEW_COLS else obj
+            snap = {"shape": [obj.height, obj.width], "columns": [str(c) for c in cols],
+                    "dtypes": [str(t) for t in sub.dtypes]}
+            if obj.height * len(cols) <= _NULL_CELL_LIMIT:
+                snap["nulls"] = [int(x) for x in sub.null_count().row(0)]
+            snap["rows"] = [[_cell(v) for v in r] for r in sub.head(_PREVIEW_ROWS).rows()]
+        else:
+            df = obj.to_frame() if getattr(obj, "ndim", 2) == 1 else obj
+            shape = list(df.shape)
+            # a meaningful index (e.g. after groupby) is data the reader wants to see
+            if type(df.index).__name__ != "RangeIndex" or df.index.name is not None:
+                df = df.head(_PREVIEW_ROWS).reset_index()
+            sub = df.iloc[:, :_PREVIEW_COLS]
+            snap = {"shape": shape, "columns": [str(c) for c in sub.columns],
+                    "dtypes": [str(t) for t in sub.dtypes]}
+            if shape[0] * sub.shape[1] <= _NULL_CELL_LIMIT and len(df) == shape[0]:
+                snap["nulls"] = [int(x) for x in sub.isna().sum().tolist()]
+            snap["rows"] = [[_cell(v) for v in r] for r in sub.head(_PREVIEW_ROWS).itertuples(index=False, name=None)]
+        snap["more_columns"] = max(0, snap["shape"][1] - len(snap["columns"]))
+        return snap
+    finally:
+        _state.busy = prev
+
+
+def _artifact(kind, obj, lib, target=None):
+    """Record a frame the script wrote (kind="write") or printed (kind="print")."""
+    if _artifact_count[0] >= _MAX_ARTIFACTS:
+        return
+    try:
+        path = os.path.abspath(os.fspath(target)) if isinstance(target, (str, os.PathLike)) else None
+        rec = {"kind": "artifact", "type": kind, "lib": lib, "path": path, "site": _call_site()}
+        rec.update(_snapshot(obj, lib))
+        _artifact_count[0] += 1
+        _emit(rec)
+    except Exception:
+        pass
+
+
+def _wrap_print(cls, name, lib):
+    """print(df) / str(df) from user code records the frame as an artifact."""
+    orig = getattr(cls, name, None)
+    if orig is None or getattr(orig, "_valet", False):
+        return
+
+    @functools.wraps(orig)
+    def wrapper(self, *args, **kwargs):
+        if getattr(_state, "busy", False) or not _from_user_code():
+            return orig(self, *args, **kwargs)
+        _state.busy = True
+        try:
+            text = orig(self, *args, **kwargs)
+        finally:
+            _state.busy = False
+        _artifact("print", self, lib)
+        return text
+
+    wrapper._valet = True
+    setattr(cls, name, wrapper)
+
+
+def _wrap_polars_write(DF, name):
+    orig = getattr(DF, name, None)
+    if orig is None or getattr(orig, "_valet", False):
+        return
+
+    @functools.wraps(orig)
+    def wrapper(self, *args, **kwargs):
+        if getattr(_state, "busy", False):
+            return orig(self, *args, **kwargs)
+        _state.busy = True
+        try:
+            result = orig(self, *args, **kwargs)
+        finally:
+            _state.busy = False
+        target = args[0] if args else kwargs.get("file", kwargs.get("path", kwargs.get("workbook")))
+        _artifact("write", self, "polars", target)
+        return result
+
+    wrapper._valet = True
+    setattr(DF, name, wrapper)
+
+
+def _patch_polars(pl):
+    DF = pl.DataFrame
+    for name in ("write_csv", "write_parquet", "write_excel", "write_json", "write_ndjson",
+                 "write_ipc", "write_avro", "write_delta", "write_database"):
+        _wrap_polars_write(DF, name)
+    _wrap_print(DF, "__str__", "polars")
+    _wrap_print(DF, "__repr__", "polars")
+
+
 def _frames_in(args, kwargs):
     """DataFrame/Series inputs among the call arguments (including lists, for concat)."""
     out = []
@@ -264,7 +380,7 @@ def _warnings(op, params, inputs, out_shape):
         if how in ("left", "inner") and rows_out > rows_in:
             w.append(
                 f"join fan-out: {rows_out - rows_in:+,} rows vs the left input "
-                f"({rows_in:,} → {rows_out:,}); join keys are not unique on the right"
+                f"({rows_in:,} -> {rows_out:,}); join keys are not unique on the right"
             )
         if how == "inner" and rows_out < rows_in:
             pct = 100 * (rows_in - rows_out) / rows_in if rows_in else 0
@@ -391,6 +507,7 @@ def _wrap_io(module, name, kind):
                 rec["out_node"] = nid
                 rec["node"] = {"id": nid, "label": _labels[nid], "profile": _profile(result)}
             elif kind == "write":
+                _artifact("write", obj, "pandas", target)
                 nid = _new_id()
                 tgt = os.path.basename(str(target)) if isinstance(target, (str, os.PathLike)) else name
                 rec["out_node"] = nid
@@ -424,6 +541,7 @@ def _patch_pandas(pd):
         _wrap_io(pd, name, "read")
     for name in ("to_csv", "to_parquet", "to_excel", "to_json", "to_feather", "to_pickle", "to_sql"):
         _wrap_io(DF, name, "write")
+    _wrap_print(DF, "__repr__", "pandas")
 
     # groupby aggregations: the input is the grouped frame, the op names the keys
     try:
@@ -547,14 +665,27 @@ def _wrap_filter(owner, name, get_frame, loc=False):
     setattr(owner, name, wrapper)
 
 
-class _PandasFinder:
-    """Patches pandas right after it is first imported (never imports it ourselves)."""
+_PATCHERS = {"pandas": _patch_pandas, "polars": _patch_polars}
+
+
+class _LibFinder:
+    """Patches pandas / polars right after each is first imported (never imports them itself)."""
+
+    def __init__(self, names):
+        self.pending = set(names)
+        self.resolving = False
 
     def find_spec(self, name, path=None, target=None):
-        if name != "pandas":
+        if name not in self.pending or self.resolving:
             return None
-        sys.meta_path.remove(self)
-        spec = importlib.util.find_spec("pandas")
+        self.resolving = True
+        try:
+            spec = importlib.util.find_spec(name)
+        finally:
+            self.resolving = False
+        self.pending.discard(name)
+        if not self.pending and self in sys.meta_path:
+            sys.meta_path.remove(self)
         if spec is None or spec.loader is None:
             return spec
         exec_module = spec.loader.exec_module
@@ -562,7 +693,7 @@ class _PandasFinder:
         def patched_exec(module):
             exec_module(module)
             try:
-                _patch_pandas(module)
+                _PATCHERS[name](module)
             except Exception:
                 pass
 
@@ -587,8 +718,12 @@ def _chain_next_sitecustomize():
 
 
 if _TRAIL and os.environ.get("VALET_TRAIL_OFF") != "1":
-    if "pandas" in sys.modules:
-        _patch_pandas(sys.modules["pandas"])
-    else:
-        sys.meta_path.insert(0, _PandasFinder())
+    _later = []
+    for _name, _patch in _PATCHERS.items():
+        if _name in sys.modules:
+            _patch(sys.modules[_name])
+        else:
+            _later.append(_name)
+    if _later:
+        sys.meta_path.insert(0, _LibFinder(_later))
 _chain_next_sitecustomize()
