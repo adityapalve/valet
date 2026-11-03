@@ -38,6 +38,19 @@ This puts `valet` on your PATH in its own isolated environment, so the agent's t
 whatever venv is active. (`pipx install …` or `pip install …` work too. For a private repo use
 `git+ssh://git@github.com/adityapalve/valet`.) Upgrade with `uv tool upgrade valet`.
 
+### No install: run from a clone
+
+valet only uses the standard library, so nothing needs building. This is the route to use if
+your network or endpoint policy blocks installers (e.g. uv or pip building wheels in a temp folder):
+
+```bash
+git clone git@github.com:adityapalve/valet.git ~/tools/valet
+```
+
+Then add the clone's `bin/` folder to your `PATH`. It has `valet` (macOS, Linux, Git Bash) and
+`valet.cmd` (Windows cmd and PowerShell); both run `bin/_launch.py` with any Python ≥ 3.9 on your
+PATH (`VALET_LAUNCH_PYTHON` overrides it). To update, `git pull`.
+
 ## Use with Amazon Q (or any agent with a terminal tool)
 
 In your project:

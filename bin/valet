@@ -1,0 +1,6 @@
+#!/bin/sh
+# Run valet straight from this clone (macOS / Linux / Git Bash). Add this bin/ folder to PATH.
+# Set VALET_LAUNCH_PYTHON to choose the interpreter that runs valet itself (any Python >= 3.9).
+DIR="$(cd "$(dirname "$0")" && pwd)"
+PY="${VALET_LAUNCH_PYTHON:-$(command -v python3 || command -v python)}"
+exec "$PY" "$DIR/_launch.py" "$@"

@@ -33,7 +33,8 @@ send you instructions through it. Follow these rules for this project:
 
 - Run Python with `valet py`, never bare `python`:
   - a script: `valet py path/to/script.py arg1 arg2`
-  - a quick snippet: `valet py -c "..."`, or a heredoc: `valet py - <<'EOF' ... EOF`
+  - a quick snippet: `valet py -c "..."`, or pipe the code in: in bash
+    `valet py - <<'EOF' ... EOF`, in PowerShell `@' ... '@ | valet py -`
 - Run other commands you want the user to see (tests, data tools, CLIs) with
   `valet run -- <command> <args>`.
 - Put throwaway scripts in `.valet/scratch/`. Edit and re-run the same file as
