@@ -74,6 +74,13 @@ send you instructions through it. Follow these rules for this project:
   ```
   `df` can be pandas, polars or a list of dicts. Aggregate first: charts use at
   most 5,000 rows. Each call prints `[valet] chart: <title>` when it worked.
+- When a decision really depends on the user's judgment (which records to exclude,
+  which of two plausible definitions to use), ask instead of guessing:
+  `if vv.ask("Drop the 2007 season?", ["yes", "no"], default="no") == "yes": ...`
+  It shows the question in the viewer and waits (up to 2 minutes) only if the user
+  is watching; otherwise it returns the default at once. Always give a sensible
+  default, ask at most a couple of questions per run, and never ask inside a loop.
+  The output says whether the user answered or the default was used.
 - When you write an output file, the run summary says how its rows changed since
   the last run, e.g. `(+12 -3 ~41 rows vs run #7)`. If that's not what you
   intended, say so and investigate before moving on.

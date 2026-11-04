@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS artifacts (
     run_id INTEGER NOT NULL REFERENCES runs(id),
     seq INTEGER NOT NULL,        -- order within the run
-    type TEXT NOT NULL,          -- write | print | chart | file | image | html
+    type TEXT NOT NULL,          -- write | print | chart | ask | file | image | html
     path TEXT,                   -- absolute path for files, NULL for printed frames
     data TEXT NOT NULL,          -- JSON: shape, columns, dtypes, nulls, rows, site, size...
     PRIMARY KEY (run_id, seq)
@@ -151,7 +151,7 @@ class Store:
                 _x(con, "UPDATE runs SET trail = ?, trail_warnings = ? WHERE id = ?",
                    (json.dumps(steps), n_warn, run_id))
         if artifacts:
-            self.set_artifacts(run_id, artifacts, replace_types=("write", "print", "chart"))
+            self.set_artifacts(run_id, artifacts, replace_types=("write", "print", "chart", "ask"))
         return steps
 
     def set_artifacts(self, run_id: int, artifacts: list[dict], replace_types=("write", "print")) -> None:

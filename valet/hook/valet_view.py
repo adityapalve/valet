@@ -6,6 +6,7 @@ valet puts this module on the import path of every run.
     vv.chart(df, x="minutes", kind="hist")
     vv.vega({...})              # any Vega-Lite spec (https://vega.github.io/vega-lite/)
     vv.table(df, "Top users")   # a dataframe as a table in the viewer
+    if vv.ask("Drop the 2007 season?", ["yes", "no"], default="no") == "yes": ...
 
 `df` can be a pandas or polars DataFrame or a list of dicts. Charts are drawn by the viewer
 (interactive, with tooltips) from up to `max_rows` rows of data; aggregate first for big data.
@@ -17,8 +18,9 @@ import json
 import math
 import os
 import sys
+import time
 
-__all__ = ["chart", "vega", "table", "key"]
+__all__ = ["chart", "vega", "table", "key", "ask"]
 
 KINDS = ("bar", "line", "point", "area", "hist", "box", "heatmap", "tick")
 
@@ -143,6 +145,88 @@ def key(path, columns):
     valet_rowdiff.set_key(valet_dir, path, [str(c) for c in columns])
     print(f"[valet] key for {path}: {', '.join(map(str, columns))}", flush=True)
     return None
+
+
+_ask_count = [0]
+
+
+def ask(question, options=None, default=None, timeout=None):
+    """Ask the user a question in the viewer and wait for the answer (a string).
+
+    options: a list of choices shown as buttons; without it, the user types an answer.
+    default: returned when nobody is watching the viewer (no tab open in the last ~15s), or
+             when no answer comes within `timeout` seconds ($VALET_ASK_TIMEOUT, default 120).
+             Always pass one: the script must work unattended.
+    Prints what happened, so the agent knows whether the user decided or the default did.
+    """
+    question = str(question).strip()
+    options = [str(o) for o in options] if options else None
+    if default is not None:
+        default = str(default)
+        if options and default not in options:
+            raise ValueError(f"valet_view.ask: default {default!r} is not one of the options {options}")
+    timeout = float(timeout if timeout is not None else os.environ.get("VALET_ASK_TIMEOUT", "120"))
+    valet_dir = os.environ.get("VALET_DIR")
+    hook = sys.modules.get("sitecustomize")
+    site = hook._call_site() if hook is not None and hasattr(hook, "_call_site") else None
+    started = time.time()
+    if not valet_dir:
+        answer, by = default, "not running under valet"
+    elif not _viewer_watching(valet_dir):
+        answer, by = default, "nobody is watching the viewer"
+    else:
+        _ask_count[0] += 1
+        aid = f"{os.environ.get('VALET_RUN_ID') or 0}-{os.getpid()}-{_ask_count[0]}"
+        asks = os.path.join(valet_dir, "asks")
+        os.makedirs(asks, exist_ok=True)
+        q_file, a_file = os.path.join(asks, aid + ".json"), os.path.join(asks, aid + ".answer.json")
+        with open(q_file + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump({"id": aid, "run_id": os.environ.get("VALET_RUN_ID"), "question": question,
+                       "options": options, "default": default, "created": started, "timeout": timeout,
+                       "site": site}, fh)
+        os.replace(q_file + ".tmp", q_file)
+        print(f"[valet] waiting up to {timeout:.0f}s for the user to answer in the viewer: {question}", flush=True)
+        answer, by = default, f"no answer within {timeout:.0f}s"
+        try:
+            while time.time() - started < timeout:
+                if os.path.exists(a_file):
+                    try:
+                        with open(a_file, encoding="utf-8") as fh:
+                            answer, by = json.load(fh)["answer"], "user"
+                        break
+                    except (OSError, ValueError, KeyError):
+                        pass   # being written; try again
+                time.sleep(0.25)
+        finally:
+            for f in (q_file, a_file):
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+    waited = round(time.time() - started, 1)
+    if hook is not None and hasattr(hook, "_emit") and os.environ.get("VALET_TRAIL"):
+        hook._emit({"kind": "artifact", "type": "ask", "title": question, "question": question,
+                    "options": options, "default": default, "answer": answer, "answered_by": by,
+                    "waited": waited, "site": site})
+    if by == "user":
+        print(f'[valet] asked the user: "{question}" -> "{answer}"', flush=True)
+    else:
+        print(f'[valet] asked the user: "{question}" -> {by}; using the default "{answer}"', flush=True)
+    return answer
+
+
+def _viewer_watching(valet_dir, within=15.0):
+    """True if a viewer for this project is running and a tab polled it in the last `within` s."""
+    import urllib.request
+    try:
+        with open(os.path.join(valet_dir, "ui.json"), encoding="utf-8") as fh:
+            port = json.load(fh)["port"]
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # never via a proxy
+        with opener.open(f"http://127.0.0.1:{port}/api/ping", timeout=1.5) as r:
+            seen = json.load(r).get("page_seen_ago")
+        return seen is not None and seen < within
+    except Exception:
+        return False
 
 
 # ---- internals -----------------------------------------------------------------------------

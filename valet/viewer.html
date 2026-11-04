@@ -198,6 +198,20 @@ pre.code span { display: block; }
 .rowdiff .old { color: var(--del); text-decoration: line-through; } .rowdiff .new { color: var(--add); }
 .rowdiff .scroll { max-height: 300px; overflow: auto; }
 .art-tools label { font-size: 12px; color: var(--muted); display: inline-flex; gap: 4px; align-items: center; cursor: pointer; }
+#asks { width: 100%; display: grid; gap: 8px; }
+#asks:empty { display: none; }
+.ask { border: 2px solid var(--accent); border-radius: 8px; padding: 10px 14px; background: var(--bg);
+  display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; animation: askin .25s ease-out; }
+@keyframes askin { from { transform: translateY(-4px); opacity: 0; } }
+.ask .q { font-weight: 650; font-size: 15px; flex: 1 1 280px; }
+.ask .q small { display: block; font-weight: 400; font-size: 12px; color: var(--muted); margin-top: 2px; }
+.ask .choices { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.ask .choices input { padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel);
+  color: var(--ink); font: inherit; min-width: 220px; }
+.ask .choices button.def { background: transparent; color: var(--accent); }
+.ask .left { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.art .answer { padding: 8px 12px; font-size: 13px; }
+.art .answer b { font-family: var(--mono); }
 .note-delivered { border-left: 3px solid var(--run); padding: 6px 10px; background: var(--panel);
   margin-top: 6px; border-radius: 0 6px 6px 0; }
 label.follow { font-size: 12px; color: var(--muted); display: flex; gap: 4px; align-items: center; }
@@ -217,6 +231,7 @@ label.follow { font-size: 12px; color: var(--muted); display: flex; gap: 4px; al
   <label class="follow"><input type="checkbox" id="follow" checked> follow latest</label>
   <span id="conn" class="badge-warn"></span>
   <div id="pending"></div>
+  <div id="asks" aria-live="polite"></div>
 </header>
 <main>
   <nav id="runs"></nav>
@@ -467,7 +482,7 @@ function renderFile(f, runId, cwd) {
 
 // ---- outputs: frames written or printed, files and images the run produced ----------------
 const artCache = new Map();   // key -> element (keeps sort/filter state across polls)
-const KIND = { write: "written", print: "printed", file: "file", image: "image", chart: "chart", html: "html" };
+const KIND = { write: "written", print: "printed", file: "file", image: "image", chart: "chart", html: "html", ask: "asked" };
 let vegaLib = null;   // loaded only when a run has a chart
 const loadVega = () => (vegaLib ||= import("/static/vega.js"));
 const MULTI_VIEW = ["facet", "hconcat", "vconcat", "concat", "repeat"];
@@ -588,8 +603,15 @@ function buildArtifact(a, r) {
       ${shape ? `<span class="art-shape">${shape}</span>` : ""}${size}${used}
       ${a.type === "html" ? `<a href="${fileUrl}" target="_blank" rel="noopener">open in a new tab</a>` : ""}
       ${a.lib ? `<span class="art-meta">${esc(a.lib)}</span>` : ""}${compareHtml(a)}
-      ${(a.type === "write" || a.type === "chart" || a.title) && loc ? `<span class="loc">${esc(loc)}</span>` : ""}</div>`;
+      ${(a.type === "write" || a.type === "chart" || a.type === "ask" || a.title) && loc ? `<span class="loc">${esc(loc)}</span>` : ""}</div>`;
   if (a.error) { el.insertAdjacentHTML("beforeend", `<div class="err">couldn't preview: ${esc(a.error)}</div>`); return el; }
+  if (a.type === "ask") {
+    el.insertAdjacentHTML("beforeend", `<div class="answer">${a.answered_by === "user"
+      ? `you answered <b>${esc(a.answer)}</b> after ${a.waited}s`
+      : `${esc(a.answered_by)}, so the script used the default <b>${esc(a.answer ?? "None")}</b>`}${
+      a.options ? ` <span class="meta">(options: ${a.options.map(esc).join(", ")})</span>` : ""}</div>`);
+    return el;
+  }
   if (a.type === "chart") {
     const box = document.createElement("div"); box.className = "chartbox";
     el.append(box); drawChart(box, a); return el;
@@ -709,6 +731,43 @@ function renderError(r) {
     <details><summary>full traceback</summary><pre>${esc(e.traceback || "")}</pre></details></div>`;
 }
 
+// ---- questions from running scripts (valet_view.ask) -----------------------------------
+const askEls = new Map();   // id -> element; kept across polls so typing isn't interrupted
+const baseTitle = document.title;
+function renderAsks(asks, runs) {
+  const box = $("#asks"), live = new Set(asks.map((q) => q.id));
+  for (const [id, el] of askEls) if (!live.has(id)) { el.remove(); askEls.delete(id); }
+  for (const q of asks) {
+    let el = askEls.get(q.id);
+    if (!el) {
+      el = document.createElement("div"); el.className = "ask"; el.dataset.id = q.id;
+      const run = runs.find((r) => String(r.id) === String(q.run_id));
+      const where = q.site && q.site.file ? `${q.site.file.split(/[\\/]/).pop()}:${q.site.line}` : "";
+      el.innerHTML = `<div class="q">${esc(q.question)}<small>run #${esc(q.run_id)}${run && run.title ? " · " + esc(run.title) : ""}${
+          where ? " · " + esc(where) : ""} is waiting for your answer</small></div>
+        <div class="choices">${q.options
+          ? q.options.map((o) => `<button class="${o === q.default ? "def" : ""}" data-answer="${esc(o)}">${esc(o)}</button>`).join("")
+          : `<input type="text" placeholder="type your answer…" aria-label="answer"><button data-send>Send</button>`}</div>
+        <span class="left"></span>`;
+      el.addEventListener("click", (e) => {
+        const b = e.target.closest("button"); if (!b) return;
+        sendAnswer(q.id, b.dataset.answer != null ? b.dataset.answer : el.querySelector("input").value);
+      });
+      const inp = el.querySelector("input");
+      if (inp) inp.addEventListener("keydown", (e) => { if (e.key === "Enter") sendAnswer(q.id, inp.value); });
+      box.append(el); askEls.set(q.id, el);
+    }
+    el.querySelector(".left").textContent = `${Math.ceil(q.remaining)}s left, then "${q.default ?? "no answer"}"`;
+  }
+  document.title = asks.length ? `(${asks.length}) question · ${baseTitle}` : baseTitle;
+}
+async function sendAnswer(id, answer) {
+  if (answer == null || !String(answer).trim()) return;
+  const r = await fetch("/api/asks/answer", { method: "POST", headers: { "X-Valet": "1" },
+                                               body: JSON.stringify({ id, answer: String(answer).trim() }) });
+  if (r.ok) { const el = askEls.get(id); if (el) { el.remove(); askEls.delete(id); } document.title = baseTitle; }
+}
+
 function renderFileBar(files) {
   if (!files.length) return "";
   const b = (v, label) => `<button class="${diffStyle === v ? "on" : ""}" data-style="${v}">${label}</button>`;
@@ -790,7 +849,7 @@ async function loadDetail(force) {
 
 async function tick() {
   try {
-    const { runs, pending } = await (await fetch("/api/runs")).json();
+    const { runs, pending, asks } = await (await fetch("/api/runs")).json();
     if (runs.length && (selected === null || $("#follow").checked)) selected = runs[0].id;
     $("#runs").innerHTML = runs.map((r) => `
       <div class="run ${r.id === selected ? "sel" : ""}" data-id="${r.id}">
@@ -800,6 +859,7 @@ async function tick() {
         ${r.title ? `<div class="title" title="${esc(r.title)}">${esc(r.title)}</div>` : ""}
         <div class="cmd" title="${esc(r.argv.join(" "))}">${esc(shortCmd(r.argv, r.cwd))}</div>
       </div>`).join("");
+    renderAsks(asks || [], runs);
     $("#pending").innerHTML = pending.map((n) =>
       `<span class="chip">queued: ${esc(n.text)}<b data-del="${n.id}" title="withdraw">×</b></span>`).join("");
     await loadDetail(false);

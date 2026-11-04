@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -724,3 +725,97 @@ def test_valet_view_bar_colors_are_grouped_and_scatter_axes_unzeroed(tmp_path):
     bar, pts = [a["spec"]["encoding"] for a in _run_json(tmp_path, 1)["artifacts"]]
     assert bar["xOffset"] == {"field": "sex"}          # side by side: stacked means would add up
     assert pts["x"]["scale"] == {"zero": False} and pts["y"]["scale"] == {"zero": False}
+
+
+# ---- vv.ask: questions to the user mid-run -----------------------------------------------------
+
+ASK_SCRIPT = ("import valet_view as vv\n"
+              "a = vv.ask('Drop the 2007 season?', ['yes', 'no'], default='no')\n"
+              "print('ANSWER', a)\n")
+
+
+def test_ask_without_a_watching_viewer_returns_the_default_at_once(tmp_path):
+    (tmp_path / "s.py").write_text(ASK_SCRIPT)
+    t0 = time.time()
+    r = valet(tmp_path, "py", "s.py")
+    assert r.returncode == 0 and time.time() - t0 < 15
+    assert "ANSWER no" in r.stdout and "nobody is watching the viewer" in r.stdout
+    (art,) = _run_json(tmp_path, 1)["artifacts"]
+    assert art["type"] == "ask" and art["answered_by"] == "nobody is watching the viewer" and art["answer"] == "no"
+    (tmp_path / "bad.py").write_text("import valet_view as vv\nvv.ask('q', ['a', 'b'], default='c')\n")
+    assert "not one of the options" in valet(tmp_path, "py", "bad.py").stdout
+
+
+def _viewer_with_watching_tab(tmp_path, port):
+    """A foreground viewer plus a thread that polls it like an open browser tab."""
+    import threading
+    proc = subprocess.Popen([sys.executable, "-m", "valet", "ui", "--foreground", "--port", str(port), "--no-browser"],
+                            cwd=tmp_path, env=_env(tmp_path), stdout=subprocess.PIPE)
+    proc.stdout.readline()
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    stop = threading.Event()
+
+    def tab():
+        while not stop.is_set():
+            try:
+                opener.open(f"http://127.0.0.1:{port}/api/runs").read()
+            except Exception:
+                pass
+            stop.wait(0.5)
+
+    threading.Thread(target=tab, daemon=True).start()
+    time.sleep(1)
+    return proc, stop, opener
+
+
+def test_ask_is_answered_in_the_viewer(tmp_path):
+    (tmp_path / "s.py").write_text(ASK_SCRIPT)
+    proc, stop, opener = _viewer_with_watching_tab(tmp_path, 8838)
+    base = "http://127.0.0.1:8838"
+    try:
+        script = subprocess.Popen([sys.executable, "-m", "valet", "py", "s.py"], cwd=tmp_path, env=_env(tmp_path),
+                                  stdout=subprocess.PIPE, text=True)
+        asks = []
+        for _ in range(60):
+            asks = json.load(opener.open(base + "/api/runs"))["asks"]
+            if asks:
+                break
+            time.sleep(0.25)
+        (q,) = asks
+        assert q["question"] == "Drop the 2007 season?" and q["options"] == ["yes", "no"] and q["remaining"] > 100
+
+        def post(body, headers={"X-Valet": "1"}):
+            req = urllib.request.Request(base + "/api/asks/answer", data=json.dumps(body).encode(),
+                                         method="POST", headers=headers)
+            try:
+                return opener.open(req).status
+            except urllib.error.HTTPError as e:
+                return e.code
+
+        assert post({"id": q["id"], "answer": "maybe"}) == 400            # not an option
+        assert post({"id": "../ui", "answer": "yes"}) == 404              # ids are validated
+        assert post({"id": q["id"], "answer": "yes"}, headers={}) == 403  # same protection as notes
+        assert post({"id": q["id"], "answer": "yes"}) == 200
+        out, _ = script.communicate(timeout=30)
+        assert "ANSWER yes" in out and '-> "yes"' in out
+        (art,) = _run_json(tmp_path, 1)["artifacts"]
+        assert art["answered_by"] == "user" and art["answer"] == "yes"
+        assert json.load(opener.open(base + "/api/runs"))["asks"] == []   # cleaned up
+    finally:
+        stop.set()
+        proc.terminate()
+        proc.wait()
+
+
+def test_ask_times_out_to_the_default(tmp_path):
+    (tmp_path / "s.py").write_text(ASK_SCRIPT)
+    proc, stop, _ = _viewer_with_watching_tab(tmp_path, 8839)
+    try:
+        r = subprocess.run([sys.executable, "-m", "valet", "py", "s.py"], cwd=tmp_path,
+                           env=_env(tmp_path, VALET_ASK_TIMEOUT="1.5"), capture_output=True, text=True, timeout=60)
+        assert "ANSWER no" in r.stdout and "no answer within 2s" in r.stdout
+        assert not list((tmp_path / ".valet" / "asks").glob("*.json"))      # the question was withdrawn
+    finally:
+        stop.set()
+        proc.terminate()
+        proc.wait()

@@ -164,6 +164,45 @@ def _pid_alive(pid) -> bool:
         return False
 
 
+# ---- questions from running scripts (valet_view.ask) ----------------------------------------
+
+_ASK_ID = re.compile(r"^\d+-\d+-\d+$")
+
+
+def pending_asks(home: Path) -> list[dict]:
+    """Questions scripts are waiting on: .valet/asks/<id>.json without a matching answer."""
+    out = []
+    d = home / "asks"
+    for f in sorted(d.glob("*.json")) if d.is_dir() else []:
+        if f.name.endswith(".answer.json") or (d / (f.stem + ".answer.json")).exists():
+            continue
+        try:
+            q = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        q["remaining"] = max(0.0, q.get("created", 0) + q.get("timeout", 0) - time.time())
+        if q["remaining"] > 0:
+            out.append(q)
+    return out
+
+
+def answer_ask(home: Path, data: dict) -> tuple[dict, int]:
+    aid, answer = str(data.get("id", "")), data.get("answer")
+    q_file = home / "asks" / f"{aid}.json"
+    if not _ASK_ID.match(aid) or not q_file.exists() or not isinstance(answer, str):
+        return {"error": "no such question"}, 404
+    try:
+        q = json.loads(q_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"error": "no such question"}, 404
+    if q.get("options") and answer not in q["options"]:
+        return {"error": "not one of the options"}, 400
+    tmp = home / "asks" / f"{aid}.answer.tmp"
+    tmp.write_text(json.dumps({"answer": answer[:2000], "answered": time.time()}), encoding="utf-8")
+    os.replace(tmp, home / "asks" / f"{aid}.answer.json")
+    return {"ok": True}, 200
+
+
 # ---- the server ------------------------------------------------------------------------
 
 def _serve_main(argv: list[str]) -> None:
@@ -183,6 +222,7 @@ def serve(store: Store, port: int = 8765, open_browser: bool = True,
     page = files("valet").joinpath("viewer.html").read_bytes()
     token = secrets.token_urlsafe(24)
     last_seen = [time.monotonic()]
+    last_page = [0.0]   # last poll by an open viewer tab: is anyone watching? (for valet_view.ask)
 
     httpd = None
     for p in range(port, port + 20):  # the default port may be taken, e.g. by an old viewer
@@ -248,13 +288,16 @@ def serve(store: Store, port: int = 8765, open_browser: bool = True,
             if path.startswith("/static/") and path[8:] in STATIC:
                 return self._send(files("valet").joinpath("static", path[8:]).read_bytes(), STATIC[path[8:]])
             if path == "/api/ping":
-                return self._json({"home": str(store.home.resolve()), "pid": os.getpid()})
+                seen = time.monotonic() - last_page[0] if last_page[0] else None
+                return self._json({"home": str(store.home.resolve()), "pid": os.getpid(), "page_seen_ago": seen})
             try:
                 m = re.fullmatch(r"/api/runs/(\d+)/artifacts/(\d+)/file", path)
                 if m:  # an image the run wrote (the only artifact files served from disk)
                     return self._artifact_file(int(m.group(1)), int(m.group(2)))
                 if path == "/api/runs":
-                    return self._json({"runs": store.list_runs(200), "pending": store.pending_notes()})
+                    last_page[0] = time.monotonic()
+                    return self._json({"runs": store.list_runs(200), "pending": store.pending_notes(),
+                                       "asks": pending_asks(store.home)})
                 if path.startswith("/api/runs/"):
                     try:
                         run = store.get_run(int(path.rsplit("/", 1)[1]))
@@ -285,6 +328,8 @@ def serve(store: Store, port: int = 8765, open_browser: bool = True,
                 threading.Thread(target=httpd.shutdown, daemon=True).start()
                 return
             try:
+                if path == "/api/asks/answer":
+                    return self._json(*answer_ask(store.home, data))
                 if path == "/api/notes" and str(data.get("text", "")).strip():
                     return self._json({"id": store.add_note(data["text"].strip())})
                 if path == "/api/notes/delete" and "id" in data:

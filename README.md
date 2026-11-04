@@ -18,6 +18,9 @@ the terminal exactly as before, so the agent's own terminal tool sees it, and on
 - **You can steer**: type a message in the viewer (or `valet note "..."`), and it is appended
   to the output of the agent's *next* run as `[valet] Message from the user`. The agent's
   rules tell it to treat that as a direct instruction.
+- **The script can ask you**: `vv.ask("Drop the 2007 season?", ["yes", "no"], default="no")`
+  pauses the run, shows the question in the viewer and continues with your answer, so you can
+  steer *during* a run (only if you're watching; otherwise it uses the default at once).
 - **A transformation tree for pandas and polars**: every DataFrame transformation is recorded with its shape
   before and after, the keys it used, the line of code, and the `#` comment above it explaining
   why, and linked into a tree of which frame came from which. Click any node for a Data
@@ -257,6 +260,31 @@ recording wrapper are skipped), the lines around it from the script *as it was i
 for common errors (missing module, missing file, missing column, ...) and the full traceback on
 demand. Failed runs are tagged with the exception type in the sidebar.
 
+### Asking you mid-run
+
+![a script asking a question in the viewer](docs/ask.png)
+
+Code mode's lesson is that scripts beat one-tool-call-per-turn; `vv.ask` turns that toward you. When
+a decision depends on your judgment, the agent's script can ask instead of guessing:
+
+```python
+import valet_view as vv
+if vv.ask("The 2007 season used a different scale. Drop those 110 birds?", ["yes", "no"], default="no") == "yes":
+    penguins = penguins.filter(pl.col("year") != 2007)
+```
+
+- The question appears as a banner at the top of the viewer, whichever run you're looking at, with
+  a button per option (or a text box when there are no options) and a countdown. The tab title
+  changes to `(1) question` so you notice it.
+- It only waits if someone is watching: a viewer tab must have polled in the last ~15s. Otherwise it
+  returns the default immediately, so an unattended agent is never stuck.
+- It waits at most `timeout` seconds (default 120, or `$VALET_ASK_TIMEOUT`), then uses the default,
+  staying well within the agent's own command timeout.
+- The agent sees what happened: `[valet] asked the user: "..." -> "yes"`, or `-> no answer within
+  120s; using the default "no"`. Each question and its answer is recorded on the run's page.
+- It's stdlib-only and talks to the viewer through `.valet/asks/`, so it works in any `valet py`
+  run, including `uv run --script` environments. Answers use the same protected endpoint as notes.
+
 ### Run titles and snippets
 
 Each run gets a readable title in the viewer: `valet py --title "Clean the penguins data" ...`, otherwise
@@ -301,7 +329,8 @@ command's output is the most reliable channel available.
 - **Kernel helpers ("code mode")**: preload `h.peek(df)`, `h.plot(...)`, `h.ask("…")` into the
   kernel so the agent reaches the viewer through code.
 - **Approve gate**: optionally hold a run until you click Run in the viewer, or edit the
-  script before it runs (must stay inside the agent's command timeout).
+  script before it runs (must stay inside the agent's command timeout; `vv.ask` already does
+  this for individual decisions).
 - **Replay ("durable" state)**: valet already stores every script version in run order, so a
   crashed or reset session (or kernel) can be rebuilt with `valet replay --until 12`. Optionally,
   checkpoint DataFrames to parquet at chosen steps so replay can resume from there.
